@@ -606,7 +606,10 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         if bg_sampling == "target_group":
             bg_pool_cells = train_cells if bg_csv is None else h3_cell_ids(bg_pool_raw, cell_to_id, H3_RES)
         if rand_pool_raw is not None:
-            rand_pool_cells = h3_cell_ids(rand_pool_raw, cell_to_id, H3_RES)
+            # rand_pool_raw is normalized [-1, 1]; H3 needs degrees. (Before this fix every random
+            # point was looked up as if it sat within ~1 degree of 0N 0E, so its effort "present"
+            # set and range penalty came from the Gulf of Guinea instead of its real location.)
+            rand_pool_cells = h3_cell_ids(rand_pool_raw * np.array([180.0, 90.0], np.float32), cell_to_id, H3_RES)
         if use_effort:
             print(f" building cell→species lookup for effort weighting (effort_scale={effort_scale})...")
             cell_species = build_cell_species(train_cells, class_ids, len(cells))
