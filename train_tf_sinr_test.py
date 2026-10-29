@@ -50,13 +50,21 @@ def load_sinr_dataset_from_npy(prefix):
     return locs, class_ids, unique_taxa
 
 
-def make_train_step(optimizer, model, bg_base_weight=1.0, grad_clip_value=None, head_optimizer=None,
+def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample_background,
+                    bg_base_weight=1.0, grad_clip_value=None, head_optimizer=None,
                     head_weight_refs=None, effort_col=None, effort_scale=0.0, cell_species=None,
                     focal_cols=None, cell_range_penalty=None, jit_compile=False, bg_batch_size=None):
-    """Returns a compiled train_step(x, ys, fake_x, pos_weight, bg_cells) -> loss.
+    """Returns a compiled train_step(idx, pos_weight) -> loss, where idx is a batch of indices
+    into the training points.
 
     `model` here must be the logits-output view (pre-sigmoid) so sinr_loss can compute a
     numerically-stable, non-vanishing gradient - see sinr_loss.py's docstring.
+
+    Everything per-step happens on-device: training points are kept as raw (lon, lat) degrees
+    (train_locs, with train_classes) and encoded per batch with encoder.encode_tf, instead of
+    holding a full encoded copy of every point in host memory (~15GB at 8M points, ~400GB at
+    230M). sample_background(batch_size) is a TF function returning (normalized [-1, 1]
+    background locations, their H3 cell ids or None).
 
     The background weighting is computed on-device from small per-run lookup tables instead of
     dense (B_bg, num_classes) matrices built in numpy every step (which cost ~85ms/step at 176k
@@ -100,8 +108,15 @@ def make_train_step(optimizer, model, bg_base_weight=1.0, grad_clip_value=None, 
             raise ValueError("jit_compile with effort weighting needs bg_batch_size")
         max_pairs = bg_batch_size * int(tf.reduce_max(cell_species.row_lengths()))
 
+    # copy the raster to the device now - creating it lazily inside the trace would embed a
+    # 1.5GB+ constant in the graph
+    encoder.encode_tf(tf.zeros([1, 2]))
+
     @tf.function(reduce_retracing=True)
-    def train_step(x, ys, fake_x, pos_weight, bg_cells):
+    def train_step(idx, pos_weight):
+        x_raw = tf.gather(train_locs, idx)
+        ys = tf.gather(train_classes, idx)
+        fake_norm, bg_cells = sample_background(tf.shape(idx)[0])
         present_idx = present_mask = None
         if use_effort:
             present = tf.gather(cell_species, bg_cells)
@@ -116,10 +131,12 @@ def make_train_step(optimizer, model, bg_base_weight=1.0, grad_clip_value=None, 
                 present_idx = tf.ensure_shape(
                     tf.pad(present_idx, [[0, max_pairs - n_pairs], [0, 0]]), [max_pairs, 2]
                 )
-        return core_step(x, ys, fake_x, pos_weight, bg_cells, present_idx, present_mask)
+        return core_step(x_raw, ys, fake_norm, pos_weight, bg_cells, present_idx, present_mask)
 
     @tf.function(reduce_retracing=True, jit_compile=jit_compile)
-    def core_step(x, ys, fake_x, pos_weight, bg_cells, present_idx, present_mask):
+    def core_step(x_raw, ys, fake_norm, pos_weight, bg_cells, present_idx, present_mask):
+        x = encoder.encode_tf(x_raw, normalize=True)
+        fake_x = encoder.encode_tf(fake_norm, normalize=False)
         with tf.GradientTape() as tape:
             logits = model(x[:, :-1], training=True)
             fake_logits = model(fake_x[:, :-1], training=True)
@@ -226,71 +243,58 @@ def subsample_to_n_taxa(locs, class_ids, unique_taxa, n_taxa, h3_idx=None):
     return locs, class_ids, unique_taxa, h3_idx
 
 
-def _subsample_arrays(hard_cap, encoded_locs, class_ids, focal_class_ids=None):
-    """Returns subsampled (locs, class_ids) arrays. focal_class_ids are never capped."""
+def _subsample_indices(hard_cap, class_ids, focal_class_ids=None):
+    """Returns indices of the subsampled training set. focal_class_ids are never capped."""
     focal_set = set(focal_class_ids) if focal_class_ids else set()
     if hard_cap == -1:
-        idx_ss = np.arange(len(class_ids))
-    else:
-        print(f"  subsampling (up to) {hard_cap} per class for the training set")
-        class_counts = {c: 0 for c in np.unique(class_ids)}
-        rng = np.random.default_rng()
-        idx_rand = rng.permutation(len(class_ids))
-        idx_ss = []
-        for i in idx_rand:
-            c = class_ids[i]
-            if c in focal_set or class_counts[c] < hard_cap:
-                idx_ss.append(i)
-                class_counts[c] += 1
-        idx_ss = np.sort(idx_ss)
-    locs_ss = np.array(encoded_locs)[idx_ss]
-    class_ids_ss = np.array(class_ids)[idx_ss]
-    return locs_ss, class_ids_ss
-
-
-def _arrays_to_dataset(locs, class_ids, batch_size, shuffle_buffer_size):
-    num_steps = len(locs) // batch_size
-    ds = tf.data.Dataset.from_tensor_slices((locs, class_ids))
-    buf = ds.cardinality() if shuffle_buffer_size is None else shuffle_buffer_size
-    ds = ds.shuffle(buffer_size=buf).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-    return ds, num_steps
+        return np.arange(len(class_ids))
+    print(f"  subsampling (up to) {hard_cap} per class for the training set")
+    class_counts = {c: 0 for c in np.unique(class_ids)}
+    rng = np.random.default_rng()
+    idx_rand = rng.permutation(len(class_ids))
+    idx_ss = []
+    for i in idx_rand:
+        c = class_ids[i]
+        if c in focal_set or class_counts[c] < hard_cap:
+            idx_ss.append(i)
+            class_counts[c] += 1
+    return np.sort(idx_ss)
 
 
 def make_subsampled_dataset_focal(
-    hard_cap, encoded_locs, class_ids, batch_size, shuffle_buffer_size,
+    hard_cap, class_ids, batch_size, shuffle_buffer_size,
     focal_class_ids=None, focal_oversample=1, focal_oversample_map=None
 ):
-    """focal_oversample_map: optional {class_id: factor} for PER-SPECIES oversampling (e.g.
+    """Dataset of shuffled batches of training-point INDICES (the step gathers and encodes the
+    points on-device - see make_train_step).
+
+    focal_oversample_map: optional {class_id: factor} for PER-SPECIES oversampling (e.g.
     sparser members of a large focal group get a bigger factor than common ones) - takes
     precedence over the flat focal_oversample int when provided. See --oversample_target_exponent."""
-    locs_ss, class_ids_ss = _subsample_arrays(
-        hard_cap, encoded_locs, class_ids, focal_class_ids
-    )
+    idx = _subsample_indices(hard_cap, class_ids, focal_class_ids)
+    class_ids_ss = class_ids[idx]
 
     if focal_class_ids and focal_oversample_map:
-        extra_locs_list, extra_cls_list = [], []
-        for fc in focal_class_ids:
-            factor = focal_oversample_map.get(fc, 1)
-            if factor > 1:
-                mask = class_ids_ss == fc
-                extra_locs_list.append(np.tile(locs_ss[mask], (factor - 1, 1)))
-                extra_cls_list.append(np.tile(class_ids_ss[mask], factor - 1))
-        if extra_locs_list:
-            locs_ss = np.concatenate([locs_ss] + extra_locs_list)
-            class_ids_ss = np.concatenate([class_ids_ss] + extra_cls_list)
+        extra = [
+            np.tile(idx[class_ids_ss == fc], focal_oversample_map.get(fc, 1) - 1)
+            for fc in focal_class_ids if focal_oversample_map.get(fc, 1) > 1
+        ]
+        if extra:
+            idx = np.concatenate([idx] + extra)
         print(f"  focal oversampled per-species (map, {len(focal_oversample_map)} classes): "
-              f"{len(locs_ss):,} total obs")
+              f"{len(idx):,} total obs")
     elif focal_class_ids and focal_oversample > 1:
-        focal_mask = np.isin(class_ids_ss, focal_class_ids)
-        extra_locs = np.tile(locs_ss[focal_mask], (focal_oversample - 1, 1))
-        extra_cls = np.tile(class_ids_ss[focal_mask], focal_oversample - 1)
-        locs_ss = np.concatenate([locs_ss, extra_locs])
-        class_ids_ss = np.concatenate([class_ids_ss, extra_cls])
-        print(f"  focal oversampled {focal_oversample}x: {len(locs_ss):,} total obs")
+        focal_idx = idx[np.isin(class_ids_ss, focal_class_ids)]
+        idx = np.concatenate([idx, np.tile(focal_idx, focal_oversample - 1)])
+        print(f"  focal oversampled {focal_oversample}x: {len(idx):,} total obs")
     else:
-        print(f"  final training set size: {len(locs_ss)}")
+        print(f"  final training set size: {len(idx)}")
 
-    return _arrays_to_dataset(locs_ss, class_ids_ss, batch_size, shuffle_buffer_size)
+    num_steps = len(idx) // batch_size
+    ds = tf.data.Dataset.from_tensor_slices(idx.astype(np.int64))
+    buf = ds.cardinality() if shuffle_buffer_size is None else shuffle_buffer_size
+    ds = ds.shuffle(buffer_size=buf).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds, num_steps
 
 
 @click.command()
@@ -519,13 +523,18 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     coord_feat_dim = encoder.num_input_feats() - raster.shape[-1] if raster is not None else encoder.num_input_feats()
     EFFORT_COL = coord_feat_dim + EFFORT_RASTER_CHANNEL
 
-    encoded_locs = encoder.encode(locs)
     num_classes = len(unique_taxa)
     print(f" training with {num_classes} classes")
 
-    # build the background pool for target-group sampling
-    rand_pool = None
-    rand_pool_raw = None  # raw (lon,lat) parallel to rand_pool rows
+    # training points stay as raw (lon, lat) degrees, on-device; each batch is encoded there
+    # (see make_train_step). Background pools are likewise raw locations + H3 cell ids.
+    locs = np.asarray(locs, dtype=np.float32)
+    class_ids = np.asarray(class_ids, dtype=np.int64)
+    train_locs_tf = tf.constant(locs)
+    train_classes_tf = tf.constant(class_ids)
+
+    bg_pool_raw = None   # target-group background locations, (lon, lat) degrees
+    rand_pool_raw = None  # pre-drawn uniform random background locations, normalized [-1, 1]
     if bg_sampling == "target_group":
         if bg_csv is not None:
             print(f"loading additional background observations from {bg_csv}")
@@ -536,25 +545,12 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
             bg_locs_extra = np.vstack(
                 (bg_df["longitude"].values, bg_df["latitude"].values)
             ).T.astype(np.float32)
-            bg_encoded_extra = encoder.encode(bg_locs_extra)
-            bg_pool = np.concatenate([np.array(encoded_locs), np.array(bg_encoded_extra)], axis=0)
             bg_pool_raw = np.concatenate([locs, bg_locs_extra], axis=0)
-            print(f" background pool: {len(bg_pool):,} points "
-                  f"({len(encoded_locs):,} training + {len(bg_locs_extra):,} extra)")
+            print(f" background pool: {len(bg_pool_raw):,} points "
+                  f"({len(locs):,} training + {len(bg_locs_extra):,} extra)")
         else:
-            bg_pool = np.array(encoded_locs)
             bg_pool_raw = locs
-            print(f" background pool: {len(bg_pool):,} points (training observations only)")
-        bg_pool = bg_pool.astype(np.float32)
-
-        if bg_tg_fraction < 1.0:
-            # pre-compute random background pool to avoid per-step raster lookups
-            n_rand_pool = len(bg_pool)
-            print(f" pre-computing random background pool ({n_rand_pool:,} points)...")
-            rand_locs = make_rand_samples_tf(n_rand_pool)
-            rand_pool = np.array(encoder.encode(rand_locs, normalize=False)).astype(np.float32)
-            rand_pool_raw = np.array(rand_locs).astype(np.float32)
-            print(f" random pool ready")
+            print(f" background pool: {len(bg_pool_raw):,} points (training observations only)")
 
     # resolve focal taxon IDs → class indices
     focal_class_ids = None
@@ -591,6 +587,17 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     use_range_penalty = range_penalty_scale > 0 and bool(focal_class_ids)
     cell_to_id = cell_species = cell_range_penalty = None
     bg_pool_cells = rand_pool_cells = None
+
+    # a fixed pool of uniform random background points: for target-group sampling's random
+    # fraction, and for pure random sampling when the range penalty needs each point's H3 cell
+    # (cells can't be computed on-device; otherwise random sampling draws fresh points each step)
+    if (bg_sampling == "target_group" and bg_tg_fraction < 1.0) or (
+        bg_sampling == "random" and use_range_penalty
+    ):
+        n_rand_pool = len(locs) if bg_pool_raw is None else len(bg_pool_raw)
+        print(f" pre-computing random background pool ({n_rand_pool:,} points)...")
+        rand_pool_raw = np.array(make_rand_samples_tf(n_rand_pool), dtype=np.float32)
+
     if use_effort or use_range_penalty:
         cells = [c for r0 in sorted(h3.get_res0_indexes()) for c in sorted(h3.h3_to_children(r0, H3_RES))]
         cell_to_id = {c: i for i, c in enumerate(cells)}
@@ -598,8 +605,8 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         train_cells = h3_cell_ids(locs, cell_to_id, H3_RES)
         if bg_sampling == "target_group":
             bg_pool_cells = train_cells if bg_csv is None else h3_cell_ids(bg_pool_raw, cell_to_id, H3_RES)
-            if rand_pool is not None:
-                rand_pool_cells = h3_cell_ids(rand_pool_raw, cell_to_id, H3_RES)
+        if rand_pool_raw is not None:
+            rand_pool_cells = h3_cell_ids(rand_pool_raw, cell_to_id, H3_RES)
         if use_effort:
             print(f" building cell→species lookup for effort weighting (effort_scale={effort_scale})...")
             cell_species = build_cell_species(train_cells, class_ids, len(cells))
@@ -610,6 +617,35 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 cells, focal_class_ids, locs, class_ids, range_penalty_scale,
                 RANGE_PENALTY_NORM_DEG, RANGE_PENALTY_CAP,
             ))
+
+    # background pools on-device, sampled inside the train step
+    bg_locs_tf = None if bg_pool_raw is None else (
+        train_locs_tf if bg_pool_raw is locs else tf.constant(bg_pool_raw)
+    )
+    bg_cells_tf = None if bg_pool_cells is None else tf.constant(bg_pool_cells)
+    rand_locs_tf = None if rand_pool_raw is None else tf.constant(rand_pool_raw)
+    rand_cells_tf = None if rand_pool_cells is None else tf.constant(rand_pool_cells)
+
+    def sample_background(batch_size):
+        """(normalized background locations, their H3 cell ids or None) for one batch."""
+        if bg_sampling == "target_group":
+            n_tg = tf.cast(tf.cast(batch_size, tf.float64) * bg_tg_fraction, tf.int32)
+            tg_idx = tf.random.uniform([n_tg], 0, tf.shape(bg_locs_tf, out_type=tf.int64)[0], dtype=tf.int64)
+            loc_parts = [encoder._normalize_coords(tf.gather(bg_locs_tf, tg_idx))]
+            cell_parts = [tf.gather(bg_cells_tf, tg_idx)] if bg_cells_tf is not None else None
+            if rand_locs_tf is not None:
+                rand_idx = tf.random.uniform(
+                    [batch_size - n_tg], 0, tf.shape(rand_locs_tf, out_type=tf.int64)[0], dtype=tf.int64
+                )
+                loc_parts.append(tf.gather(rand_locs_tf, rand_idx))
+                if cell_parts is not None:
+                    cell_parts.append(tf.gather(rand_cells_tf, rand_idx))
+            bg_cells = tf.concat(cell_parts, axis=0) if cell_parts is not None else None
+            return tf.concat(loc_parts, axis=0), bg_cells
+        if rand_locs_tf is not None:
+            rand_idx = tf.random.uniform([batch_size], 0, tf.shape(rand_locs_tf, out_type=tf.int64)[0], dtype=tf.int64)
+            return tf.gather(rand_locs_tf, rand_idx), tf.gather(rand_cells_tf, rand_idx)
+        return make_rand_samples_tf(batch_size), None
 
     if focal_head_dim > 0:
         if not focal_class_ids:
@@ -661,7 +697,6 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
 
     ds, num_train_steps_per_epoch = make_subsampled_dataset_focal(
         config["hard_cap"],
-        encoded_locs,
         class_ids,
         config["batch_size"],
         config["shuffle_buffer_size"],
@@ -751,7 +786,8 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     pos_weight = tf.constant(pos_weight_np, dtype=tf.float32)
 
     train_step = make_train_step(
-        optimizer, logits_model, bg_base_weight=bg_base_weight, grad_clip_value=grad_clip_value,
+        optimizer, logits_model, encoder, train_locs_tf, train_classes_tf, sample_background,
+        bg_base_weight=bg_base_weight, grad_clip_value=grad_clip_value,
         head_optimizer=head_optimizer, head_weight_refs=head_weight_refs, effort_col=EFFORT_COL,
         effort_scale=effort_scale if use_effort else 0.0, cell_species=cell_species,
         focal_cols=focal_class_ids, cell_range_penalty=cell_range_penalty, jit_compile=jit_compile,
@@ -771,7 +807,6 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
             print(" re subsampling dataset")
             ds, _ = make_subsampled_dataset_focal(
                 config["hard_cap"],
-                encoded_locs,
                 class_ids,
                 config["batch_size"],
                 config["shuffle_buffer_size"],
@@ -781,31 +816,9 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
             )
 
         pbar = tqdm.tqdm(total=num_train_steps_per_epoch, dynamic_ncols=True)
-        for step, (x_batch_train, y_batch_train) in enumerate(ds):
+        for step, idx_batch in enumerate(ds):
             pbar.update()
-            batch_size_actual = len(x_batch_train)
-            if bg_sampling == "target_group":
-                n_tg = int(batch_size_actual * bg_tg_fraction)
-                n_rand = batch_size_actual - n_tg
-                tg_idx = np.random.randint(0, len(bg_pool), size=n_tg)
-                parts = [bg_pool[tg_idx]]
-                cell_parts = [bg_pool_cells[tg_idx]] if bg_pool_cells is not None else None
-                if n_rand > 0 and rand_pool is not None:
-                    rand_idx = np.random.randint(0, len(rand_pool), size=n_rand)
-                    parts.append(rand_pool[rand_idx])
-                    if cell_parts is not None:
-                        cell_parts.append(rand_pool_cells[rand_idx])
-                fake_x = tf.constant(np.concatenate(parts, axis=0))
-                bg_cells = tf.constant(np.concatenate(cell_parts)) if cell_parts is not None else None
-            else:
-                rand_loc = make_rand_samples_tf(batch_size_actual)
-                fake_x = encoder.encode(rand_loc, normalize=False)
-                bg_cells = (
-                    tf.constant(h3_cell_ids(np.array(rand_loc), cell_to_id, H3_RES))
-                    if cell_to_id is not None else None
-                )
-
-            loss = train_step(x_batch_train, y_batch_train, fake_x, pos_weight, bg_cells)
+            loss = train_step(idx_batch, pos_weight)
 
             global_step = (epoch * num_train_steps_per_epoch) + step
             if step % 10 == 0:

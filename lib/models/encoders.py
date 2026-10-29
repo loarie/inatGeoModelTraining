@@ -24,6 +24,52 @@ class CoordEncoder:
 
         return loc_feats
 
+    def encode_tf(self, locs, normalize=True):
+        """Same output as encode(), but pure TensorFlow ops (no numpy), so it can run inside a
+        tf.function / XLA on the GPU. The raster is copied to the device once, on first use."""
+        if normalize:
+            locs = self._normalize_coords(locs)
+
+        if self.encoding_strategy == "sinusoidal":
+            loc_feats = self._encode_loc_sinusoidal(locs)
+        elif self.encoding_strategy == "sinusoidal_hd":
+            loc_feats = self._encode_loc_sinusoidal_hd(locs)
+
+        if self.raster is not None:
+            loc_feats = tf.concat([loc_feats, self._bilinear_interpolate_tf(locs)], 1)
+
+        return loc_feats
+
+    def _bilinear_interpolate_tf(self, loc_ip):
+        # TF port of _bilinear_interpolate (same arithmetic, so results match to float rounding)
+        if not hasattr(self, "_raster_tf"):
+            self._raster_tf = tf.constant(np.nan_to_num(self.raster, nan=0.0), dtype=tf.float32)
+        data = self._raster_tf
+        height, width = self.raster.shape[0], self.raster.shape[1]
+
+        loc = (loc_ip + 1) / 2.0
+        x = loc[:, 0] * (width - 1)
+        y = (1 - loc[:, 1]) * (height - 1)
+
+        x_floor = tf.floor(x)
+        y_floor = tf.floor(y)
+        xx = tf.cast(x_floor, tf.int32)
+        yy = tf.cast(y_floor, tf.int32)
+        xx_plus = tf.minimum(xx + 1, width - 1)
+        yy_plus = tf.minimum(yy + 1, height - 1)
+        dx = tf.expand_dims(x - x_floor, 1)
+        dy = tf.expand_dims(y - y_floor, 1)
+
+        def at(rows, cols):
+            return tf.gather_nd(data, tf.stack([rows, cols], axis=1))
+
+        return (
+            at(yy, xx) * (1 - dx) * (1 - dy)
+            + at(yy, xx_plus) * dx * (1 - dy)
+            + at(yy_plus, xx) * (1 - dx) * dy
+            + at(yy_plus, xx_plus) * dx * dy
+        )
+
     def num_input_feats(self):
         if self.encoding_strategy == "sinusoidal_hd":
             coord_feats = 14

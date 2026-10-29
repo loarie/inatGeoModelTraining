@@ -2,8 +2,8 @@
 of a full-scale (~120k-176k species) run without needing the full dataset.
 
 Uses random inputs with v42's shapes (55 input features, hidden_dim 512, batch 512 positives +
-512 background) and synthetic effort / range-penalty tables, so it exercises exactly the same
-compiled step as a real run. Prints ms/step for each configuration; anything that runs out of
+512 background), synthetic raw points + raster, and synthetic effort / range-penalty tables, so
+it exercises exactly the same compiled step as a real run, including on-device encoding. Prints ms/step for each configuration; anything that runs out of
 GPU memory is reported and skipped.
 
   python cloud/bench_scale.py                # default sweep
@@ -21,7 +21,9 @@ import numpy as np
 import tensorflow as tf
 
 from lib.models.geo_model_net import make_geo_model_net_independent_head, IndependentPerClassHead
+from lib.models.encoders import CoordEncoder
 from train_tf_sinr_test import make_train_step
+from utils import make_rand_samples_tf
 
 N_FEATS = 56          # encoded width; the model sees N_FEATS - 1, as in training
 EFFORT_COL = 14 + 22  # sinusoidal_hd coord feats + effort raster channel
@@ -44,23 +46,34 @@ def bench(num_classes, n_focal, batch, hidden, head_dim, jit, steps, species_per
     cell_species = tf.RaggedTensor.from_row_lengths(values, lengths)
     cell_range_penalty = tf.constant(rng.uniform(0, 15, (N_CELLS, n_focal)).astype(np.float16))
 
+    # synthetic raw training points + a reduced-resolution raster with the real channel count
+    # (encoding cost is dominated by the gather, not the raster's size)
+    n_points = 2_000_000
+    train_locs = tf.constant(np.stack([rng.uniform(-180, 180, n_points), rng.uniform(-90, 90, n_points)], 1)
+                             .astype(np.float32))
+    train_classes = tf.constant(rng.integers(0, num_classes, n_points))
+    encoder = CoordEncoder("sinusoidal_hd", rng.normal(size=(540, 1080, N_FEATS - 14)).astype(np.float32))
+    occupied_t = tf.constant(occupied.astype(np.int32))
+
+    def sample_background(batch_size):
+        cells = tf.gather(occupied_t, tf.random.uniform([batch_size], 0, len(occupied), dtype=tf.int32))
+        return make_rand_samples_tf(batch_size), cells
+
     step = make_train_step(
-        tf.keras.optimizers.Adam(1e-4, clipnorm=1.0), logits_model, bg_base_weight=1.5,
-        grad_clip_value=1.0, head_optimizer=tf.keras.optimizers.Adam(1e-4), head_weight_refs=refs,
+        tf.keras.optimizers.Adam(1e-4, clipnorm=1.0), logits_model, encoder, train_locs, train_classes,
+        sample_background, bg_base_weight=1.5, grad_clip_value=1.0,
+        head_optimizer=tf.keras.optimizers.Adam(1e-4), head_weight_refs=refs,
         effort_col=EFFORT_COL, effort_scale=5.0, cell_species=cell_species, focal_cols=focal,
         cell_range_penalty=cell_range_penalty, jit_compile=jit, bg_batch_size=batch,
     )
-    x = tf.random.normal((batch, N_FEATS))
-    fake_x = tf.random.normal((batch, N_FEATS))
-    ys = tf.constant(rng.integers(0, num_classes, batch))
     pw = tf.constant(np.full(num_classes, 2.25, np.float32))
-    bg_cells = tf.constant(occupied[rng.integers(0, len(occupied), batch)].astype(np.int32))
+    idx = lambda: tf.random.uniform([batch], 0, n_points, dtype=tf.int64)
 
     for _ in range(3):  # trace + warm up
-        float(step(x, ys, fake_x, pw, bg_cells))
+        float(step(idx(), pw))
     t0 = time.perf_counter()
     for _ in range(steps):
-        loss = step(x, ys, fake_x, pw, bg_cells)
+        loss = step(idx(), pw)
     float(loss)
     ms = (time.perf_counter() - t0) / steps * 1000
     params = model.count_params() / 1e6
