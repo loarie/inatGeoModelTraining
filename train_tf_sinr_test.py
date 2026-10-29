@@ -178,6 +178,23 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
     return train_step
 
 
+def make_multi_step(train_step):
+    """Wraps a make_train_step step so one compiled call runs a whole block of steps:
+    run(idx_block, pos_weight) -> per-step losses, for idx_block of shape (n_steps, batch).
+    Calling the step once per batch from Python costs a host sync plus Python/dispatch overhead
+    every step - on an H100 that roughly doubled the time of a v42-sized step (10ms vs a
+    ~3-5ms compiled step)."""
+    @tf.function(reduce_retracing=True)
+    def run(idx_block, pos_weight):
+        n_steps = tf.shape(idx_block)[0]
+        losses = tf.TensorArray(tf.float32, size=n_steps)
+        for i in tf.range(n_steps):
+            losses = losses.write(i, train_step(idx_block[i], pos_weight))
+        return losses.stack()
+
+    return run
+
+
 def h3_cell_ids(lonlat, cell_to_id, res):
     """Global integer H3 cell id for each (lon, lat) row."""
     return np.fromiter(
@@ -263,10 +280,11 @@ def _subsample_indices(hard_cap, class_ids, focal_class_ids=None):
 
 def make_subsampled_dataset_focal(
     hard_cap, class_ids, batch_size, shuffle_buffer_size,
-    focal_class_ids=None, focal_oversample=1, focal_oversample_map=None
+    focal_class_ids=None, focal_oversample=1, focal_oversample_map=None, steps_per_call=1
 ):
-    """Dataset of shuffled batches of training-point INDICES (the step gathers and encodes the
-    points on-device - see make_train_step).
+    """Dataset of blocks of shuffled batches of training-point INDICES, shape
+    (<= steps_per_call, batch_size) - the step gathers and encodes the points on-device (see
+    make_train_step / make_multi_step).
 
     focal_oversample_map: optional {class_id: factor} for PER-SPECIES oversampling (e.g.
     sparser members of a large focal group get a bigger factor than common ones) - takes
@@ -293,7 +311,10 @@ def make_subsampled_dataset_focal(
     num_steps = len(idx) // batch_size
     ds = tf.data.Dataset.from_tensor_slices(idx.astype(np.int64))
     buf = ds.cardinality() if shuffle_buffer_size is None else shuffle_buffer_size
-    ds = ds.shuffle(buffer_size=buf).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    # full batches only (the < batch_size leftover points of each shuffled epoch are skipped),
+    # grouped into blocks of steps_per_call batches for make_multi_step
+    ds = (ds.shuffle(buffer_size=buf).batch(batch_size, drop_remainder=True)
+          .batch(steps_per_call).prefetch(tf.data.AUTOTUNE))
     return ds, num_steps
 
 
@@ -442,6 +463,9 @@ def make_subsampled_dataset_focal(
                    "starting weight. Saved automatically alongside every checkpoint whenever "
                    "--pos_weight_adapt is on (see {model_save_name}.epoch{N}.pos_weight.npy) - pass that "
                    "file back in here when resuming.")
+@click.option("--steps_per_call", default=50, type=int,
+              help="Training steps run per compiled call (make_multi_step). The host syncs, logs and "
+                   "updates the progress bar once per block instead of every step. 1 = per-step.")
 @click.option("--jit_compile", is_flag=True, default=False,
               help="XLA-compile the training step (tf.function(jit_compile=True)). Can be much faster "
                    "on GPU; off by default until verified on the target hardware.")
@@ -454,7 +478,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 pos_weight_boost_taxa, pos_weight_boost_factor,
                 pos_weight_adapt, pos_weight_adapt_every, pos_weight_adapt_threshold,
                 pos_weight_adapt_factor, pos_weight_adapt_max, pos_weight_adapt_taxa,
-                pos_weight_init_file, jit_compile):
+                pos_weight_init_file, jit_compile, steps_per_call):
     if focal_head_dim > 0 and independent_head_dim > 0:
         raise click.UsageError("--focal_head_dim and --independent_head_dim are mutually exclusive")
     with open(config_file, "r") as f:
@@ -706,6 +730,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         focal_class_ids=focal_class_ids,
         focal_oversample=focal_oversample,
         focal_oversample_map=focal_oversample_map,
+        steps_per_call=steps_per_call,
     )
 
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
@@ -796,6 +821,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         focal_cols=focal_class_ids, cell_range_penalty=cell_range_penalty, jit_compile=jit_compile,
         bg_batch_size=config["batch_size"],
     )
+    run_steps = make_multi_step(train_step)
 
     prev_epoch_loss = None
     prev_prev_epoch_loss = None
@@ -816,23 +842,23 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 focal_class_ids=focal_class_ids,
                 focal_oversample=focal_oversample,
                 focal_oversample_map=focal_oversample_map,
+                steps_per_call=steps_per_call,
             )
 
         pbar = tqdm.tqdm(total=num_train_steps_per_epoch, dynamic_ncols=True)
-        for step, idx_batch in enumerate(ds):
-            pbar.update()
-            loss = train_step(idx_batch, pos_weight)
-
-            global_step = (epoch * num_train_steps_per_epoch) + step
-            if step % 10 == 0:
-                log_entry = {
-                    "batch_loss": loss,
-                    "learning_rate": optimizer.learning_rate.numpy(),
-                }
-                wandb.log(log_entry, step=global_step, commit=True)
-
-            pbar.set_description(f" Loss {loss:.4f}")
-            epoch_losses.append(loss.numpy())
+        step = 0
+        for idx_block in ds:
+            block_losses = run_steps(idx_block, pos_weight).numpy()
+            pbar.update(len(block_losses))
+            for i in range(-(-step // 10) * 10 - step, len(block_losses), 10):
+                # same cadence as before: batch_loss logged every 10th step
+                wandb.log(
+                    {"batch_loss": block_losses[i], "learning_rate": optimizer.learning_rate.numpy()},
+                    step=epoch * num_train_steps_per_epoch + step + i, commit=True,
+                )
+            pbar.set_description(f" Loss {block_losses[-1]:.4f}")
+            epoch_losses.extend(block_losses.tolist())
+            step += len(block_losses)
 
         pbar.close()
         epoch_loss = np.mean(epoch_losses)

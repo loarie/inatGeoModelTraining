@@ -2,7 +2,8 @@
 compiled step (synthetic tables, as in bench_scale.py) three ways:
   1. no per-step host sync (what bench_scale.py measures)
   2. host sync every step via loss.numpy() (what the training loop does)
-  3. indices pulled from a tf.data shuffle/batch pipeline + per-step sync (the real loop)
+  3. indices pulled from a tf.data shuffle/batch pipeline + per-step sync (the old real loop)
+  4. blocks of --steps_per_call batches through make_multi_step, one sync per block (current loop)
   python cloud/profile_loop.py [--jit]
 """
 import argparse
@@ -18,12 +19,13 @@ import tensorflow as tf
 
 from lib.models.encoders import CoordEncoder
 from lib.models.geo_model_net import make_geo_model_net_independent_head, IndependentPerClassHead
-from train_tf_sinr_test import make_train_step
+from train_tf_sinr_test import make_train_step, make_multi_step
 from utils import make_rand_samples_tf
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--jit", action="store_true")
 ap.add_argument("--steps", type=int, default=300)
+ap.add_argument("--steps_per_call", type=int, default=50)
 ap.add_argument("--species_per_cell", type=float, default=27, help="v42 real data: ~121 present classes per sampled bg row")
 args = ap.parse_args()
 
@@ -59,8 +61,14 @@ idx_fixed = tf.random.uniform([B], 0, N_POINTS, dtype=tf.int64)
 ds = tf.data.Dataset.from_tensor_slices(rng.integers(0, N_POINTS, B * (args.steps + 10)).astype(np.int64))
 ds = ds.shuffle(500_000).batch(B).prefetch(tf.data.AUTOTUNE)
 
+run_steps = make_multi_step(step)
+ds_blocks = tf.data.Dataset.from_tensor_slices(rng.integers(0, N_POINTS, B * (args.steps + 10)).astype(np.int64))
+ds_blocks = (ds_blocks.shuffle(500_000).batch(B, drop_remainder=True).batch(args.steps_per_call)
+             .prefetch(tf.data.AUTOTUNE))
+
 for _ in range(5):
     float(step(idx_fixed, pw))
+run_steps(next(iter(ds_blocks)), pw).numpy()  # trace
 
 def timed(name, fn):
     t0 = time.perf_counter()
@@ -82,6 +90,13 @@ def real_loop():
             break
         step(idx, pw).numpy()
 
+def block_loop():
+    done = 0
+    for block in ds_blocks:
+        done += len(run_steps(block, pw).numpy())
+        if done >= args.steps:
+            break
+
 def dataset_only():
     for i, idx in enumerate(ds):
         if i == args.steps:
@@ -91,4 +106,5 @@ print(f"GPUs: {tf.config.list_physical_devices('GPU')}  jit={args.jit}")
 timed("1. compiled step, no per-step sync", no_sync)
 timed("2. compiled step, loss.numpy() every step", sync_each)
 timed("3. tf.data indices + loss.numpy() every step", real_loop)
+timed(f"4. make_multi_step, {args.steps_per_call} steps per call", block_loop)
 timed("   tf.data iteration alone", dataset_only)
