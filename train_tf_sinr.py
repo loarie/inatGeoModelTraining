@@ -14,7 +14,7 @@ import wandb
 from lib.models.geo_model_net import make_geo_model_net
 from utils import make_rand_samples_tf
 from lib.models.encoders import CoordEncoder
-from sinr_loss import sinr_loss
+from sinr_loss import sinr_loss_legacy as sinr_loss
 from lib.data.data_loader import (
     make_subsampled_dataset,
     load_inat_dataset_from_parquet,
