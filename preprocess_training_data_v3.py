@@ -69,6 +69,13 @@ def parse_args():
                         "--hard_cap - all their qualifying (non-captive, accuracy-ok) observations are "
                         "kept, same treatment as --supplement_csvs species but sourced from the main "
                         "file instead of needing a separate CSV per species.")
+    p.add_argument("--random_cap", action="store_true", default=False,
+                   help="Pick each capped species' --hard_cap observations uniformly at random (seeded, "
+                        "exact count) instead of the first --hard_cap rows in file order. The export's "
+                        "row order is not random (e.g. by observation id/date), so with a cap that "
+                        "actually binds, first-N keeps a species' oldest records. Off by default so "
+                        "earlier builds stay reproducible.")
+    p.add_argument("--seed", type=int, default=0, help="RNG seed for --random_cap")
     p.add_argument("--guarantee_taxa_file", type=str, default=None,
                    help="Path to a .npy file of taxon_ids, alternative to --guarantee_taxa for a large list.")
     return p.parse_args()
@@ -258,6 +265,20 @@ def main():
     focal_write_end = write_idx
     print(f"  Focal points written: {focal_write_end:,}")
 
+    # --random_cap: for each species over the cap, choose in advance WHICH of its qualifying rows
+    # (by rank in file order, 0..count-1) to keep. Pass 2 sees exactly pass 1's qualifying rows in
+    # the same order (same filters), so the ranks line up and the kept count is exact.
+    keep_ranks = {}
+    if args.random_cap:
+        rng = np.random.default_rng(args.seed)
+        for tid in all_bg_taxa:
+            if tid not in guarantee_taxa_set and bg_count[tid] > args.hard_cap:
+                keep_ranks[tid] = np.sort(rng.choice(bg_count[tid], args.hard_cap, replace=False))
+        print(f"  random_cap: {len(keep_ranks):,} taxa over the cap get a random {args.hard_cap:,} "
+              f"(seed {args.seed})")
+    keep_ptr = defaultdict(int)
+    bg_seen = defaultdict(int)
+
     # ================= Pass 2: fill pre-allocated bg arrays =================
     print(f"\nPass 2: writing bg observations directly into pre-allocated arrays ...")
     bg_running = defaultdict(int)
@@ -280,7 +301,14 @@ def main():
             lon, lat, tid = parsed
             if tid in focal_taxon_ids or tid not in kept_bg_set:
                 continue
-            if tid not in guarantee_taxa_set and bg_running[tid] >= args.hard_cap:
+            if tid in keep_ranks:
+                rank = bg_seen[tid]
+                bg_seen[tid] += 1
+                ranks, ptr = keep_ranks[tid], keep_ptr[tid]
+                if ptr >= len(ranks) or ranks[ptr] != rank:
+                    continue
+                keep_ptr[tid] = ptr + 1
+            elif tid not in guarantee_taxa_set and bg_running[tid] >= args.hard_cap:
                 continue
 
             cls = taxa_to_idx[tid]
