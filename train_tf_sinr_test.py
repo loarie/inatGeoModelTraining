@@ -1,7 +1,6 @@
 import json
 import math
 import os
-from collections import defaultdict
 from pathlib import Path
 
 import click
@@ -51,10 +50,22 @@ def load_sinr_dataset_from_npy(prefix):
     return locs, class_ids, unique_taxa
 
 
-def apply_gradient(optimizer, model, x, ys, fake_x, pos_weight, effort_bg_matrix=None, bg_base_weight=1.0,
-                    grad_clip_value=None, head_optimizer=None, head_weight_refs=None):
-    """`model` here must be the logits-output view (pre-sigmoid) so sinr_loss can compute a
+def make_train_step(optimizer, model, bg_base_weight=1.0, grad_clip_value=None, head_optimizer=None,
+                    head_weight_refs=None, effort_col=None, effort_scale=0.0, cell_species=None,
+                    focal_cols=None, cell_range_penalty=None, jit_compile=False):
+    """Returns a compiled train_step(x, ys, fake_x, pos_weight, bg_cells) -> loss.
+
+    `model` here must be the logits-output view (pre-sigmoid) so sinr_loss can compute a
     numerically-stable, non-vanishing gradient - see sinr_loss.py's docstring.
+
+    The background weighting is computed on-device from small per-run lookup tables instead of
+    dense (B_bg, num_classes) matrices built in numpy every step (which cost ~85ms/step at 176k
+    classes, plus ~150ms/step for 500 per-step KD-tree queries at v42 scale):
+      cell_species:       RaggedTensor, row per global H3 cell id -> class ids present there.
+      cell_range_penalty: (n_cells, n_focal) range penalty per H3 cell centroid, focal_cols order.
+      bg_cells:           (B_bg,) global H3 cell id of each background point (None if unused).
+    effort_scale > 0 with cell_species enables effort weighting; cell_range_penalty enables the
+    range penalty.
 
     head_optimizer/head_weight_refs: if given, IndependentPerClassHead's own W1/b1/W2/b2 get
     updated through a SEPARATE optimizer with no clipping at all, instead of through `optimizer`
@@ -68,40 +79,93 @@ def apply_gradient(optimizer, model, x, ys, fake_x, pos_weight, effort_bg_matrix
     head: it exists specifically to stop one class's gradient from dominating a SHARED parameter
     (see the comment below, added after v30), and IndependentPerClassHead has no shared
     parameters between classes by construction - there's nothing for one class to crowd out."""
-    with tf.GradientTape() as tape:
-        logits = model(x[:, :-1], training=True)
-        fake_logits = model(fake_x[:, :-1], training=True)
-        loss = sinr_loss(ys, logits, fake_logits, pos_weight, effort_bg_matrix=effort_bg_matrix, bg_base_weight=bg_base_weight)
-
     weights = model.trainable_weights
-    gradients = tape.gradient(loss, weights)
+    head_weight_refs = head_weight_refs or set()
+    head_vars = [w for w in weights if id(w) in head_weight_refs]
+    other_vars = [w for w in weights if id(w) not in head_weight_refs]
+    # build optimizer slots eagerly - a tf.function may only create variables on its first trace
+    optimizer.build(other_vars)
+    if head_optimizer is not None and head_vars:
+        head_optimizer.build(head_vars)
+    use_effort = effort_scale > 0 and cell_species is not None
+    focal_cols_t = tf.constant(focal_cols, dtype=tf.int32) if cell_range_penalty is not None else None
 
-    if head_optimizer is not None:
+    @tf.function(reduce_retracing=True, jit_compile=jit_compile)
+    def train_step(x, ys, fake_x, pos_weight, bg_cells):
+        with tf.GradientTape() as tape:
+            logits = model(x[:, :-1], training=True)
+            fake_logits = model(fake_x[:, :-1], training=True)
+            bg_effort = present_idx = bg_range_penalty = None
+            if use_effort:
+                bg_effort = effort_scale * fake_x[:, effort_col]
+                present = tf.gather(cell_species, bg_cells)
+                present_idx = tf.stack(
+                    [present.value_rowids(), tf.cast(present.flat_values, tf.int64)], axis=1
+                )
+            if cell_range_penalty is not None:
+                bg_range_penalty = tf.cast(tf.gather(cell_range_penalty, bg_cells), tf.float32)
+            loss = sinr_loss(
+                ys, logits, fake_logits, pos_weight, bg_base_weight=bg_base_weight,
+                bg_effort=bg_effort, present_idx=present_idx, focal_cols=focal_cols_t,
+                bg_range_penalty=bg_range_penalty,
+            )
+
+        gradients = tape.gradient(loss, weights)
         head_pairs = [(g, w) for g, w in zip(gradients, weights) if id(w) in head_weight_refs]
         other_pairs = [(g, w) for g, w in zip(gradients, weights) if id(w) not in head_weight_refs]
-    else:
-        head_pairs = []
-        other_pairs = list(zip(gradients, weights))
 
-    if grad_clip_value is not None:
-        # per-element clip BEFORE the optimizer's own global-norm clip (clipnorm=1.0, set on
-        # the Adam optimizer itself) - clipnorm alone can't stop one output column (e.g. one
-        # class's weights in a 5,000+-wide shared layer) from absorbing a disproportionate,
-        # badly-directed share of the norm budget. This bounds any single gradient element
-        # directly, added after v30's 5,007-species run diverged (85% of classes collapsed to
-        # near-zero output within a few epochs). Only applied to `other_pairs` (the shared
-        # backbone) - see head_optimizer docstring above for why the independent head is exempt.
-        other_pairs = [
-            (tf.clip_by_value(g, -grad_clip_value, grad_clip_value) if g is not None else None, w)
-            for g, w in other_pairs
-        ]
+        if grad_clip_value is not None:
+            # per-element clip BEFORE the optimizer's own global-norm clip (clipnorm=1.0, set on
+            # the Adam optimizer itself) - clipnorm alone can't stop one output column (e.g. one
+            # class's weights in a 5,000+-wide shared layer) from absorbing a disproportionate,
+            # badly-directed share of the norm budget. This bounds any single gradient element
+            # directly, added after v30's 5,007-species run diverged (85% of classes collapsed to
+            # near-zero output within a few epochs). Only applied to `other_pairs` (the shared
+            # backbone) - see head_optimizer docstring above for why the independent head is exempt.
+            other_pairs = [
+                (tf.clip_by_value(g, -grad_clip_value, grad_clip_value) if g is not None else None, w)
+                for g, w in other_pairs
+            ]
 
-    if other_pairs:
-        optimizer.apply_gradients(other_pairs)
-    if head_pairs:
-        head_optimizer.apply_gradients(head_pairs)
+        if other_pairs:
+            optimizer.apply_gradients(other_pairs)
+        if head_pairs:
+            head_optimizer.apply_gradients(head_pairs)
 
-    return loss
+        return loss
+
+    return train_step
+
+
+def h3_cell_ids(lonlat, cell_to_id, res):
+    """Global integer H3 cell id for each (lon, lat) row."""
+    return np.fromiter(
+        (cell_to_id[h3.geo_to_h3(float(lat), float(lon), res)] for lon, lat in lonlat),
+        dtype=np.int32, count=len(lonlat),
+    )
+
+
+def build_cell_species(train_cell_ids, class_ids, n_cells):
+    """RaggedTensor with one row per global H3 cell id: the (unique) classes observed there."""
+    pairs = np.unique(np.stack([train_cell_ids.astype(np.int64), class_ids.astype(np.int64)], axis=1), axis=0)
+    row_splits = np.searchsorted(pairs[:, 0], np.arange(n_cells + 1)).astype(np.int64)
+    print(f"  {len(np.unique(pairs[:, 0])):,} occupied H3 cells, {len(pairs):,} cell-species pairs")
+    return tf.RaggedTensor.from_row_splits(tf.constant(pairs[:, 1].astype(np.int32)), tf.constant(row_splits))
+
+
+def build_cell_range_penalty(cells, focal_class_ids, locs, class_ids, scale, norm_deg, cap):
+    """(n_cells, n_focal) float16: for each H3 cell centroid, the range penalty for each focal
+    class - min(distance in degrees to that species' nearest real observation / norm_deg, cap)
+    * scale. Same formula as the old per-step KD-tree query, evaluated once per cell centroid
+    instead of once per background point (cells are ~0.2 degrees across at res 4)."""
+    centroids = np.array([h3.h3_to_geo(c)[::-1] for c in cells], dtype=np.float64)  # (lon, lat)
+    table = np.empty((len(cells), len(focal_class_ids)), dtype=np.float16)
+    for i, fc in enumerate(tqdm.tqdm(focal_class_ids, desc="  range penalty table")):
+        dist_deg, _ = cKDTree(locs[class_ids == fc]).query(
+            centroids, distance_upper_bound=norm_deg * cap, workers=-1
+        )
+        table[:, i] = np.minimum(dist_deg / norm_deg, cap) * scale
+    return table
 
 
 def adapt_pos_weight(fcnet, encoder, locs, class_ids, watch_class_ids, pos_weight_np,
@@ -350,6 +414,9 @@ def make_subsampled_dataset_focal(
                    "starting weight. Saved automatically alongside every checkpoint whenever "
                    "--pos_weight_adapt is on (see {model_save_name}.epoch{N}.pos_weight.npy) - pass that "
                    "file back in here when resuming.")
+@click.option("--jit_compile", is_flag=True, default=False,
+              help="XLA-compile the training step (tf.function(jit_compile=True)). Can be much faster "
+                   "on GPU; off by default until verified on the target hardware.")
 def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fraction, num_taxa, num_epochs,
                 batch_size, no_wandb, focal_taxa, pos_weight, focal_oversample, start_epoch,
                 range_penalty_scale, bg_base_weight, focal_head_dim, focal_head_random_init,
@@ -359,7 +426,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 pos_weight_boost_taxa, pos_weight_boost_factor,
                 pos_weight_adapt, pos_weight_adapt_every, pos_weight_adapt_threshold,
                 pos_weight_adapt_factor, pos_weight_adapt_max, pos_weight_adapt_taxa,
-                pos_weight_init_file):
+                pos_weight_init_file, jit_compile):
     if focal_head_dim > 0 and independent_head_dim > 0:
         raise click.UsageError("--focal_head_dim and --independent_head_dim are mutually exclusive")
     with open(config_file, "r") as f:
@@ -435,8 +502,6 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     # build the background pool for target-group sampling
     rand_pool = None
     rand_pool_raw = None  # raw (lon,lat) parallel to rand_pool rows
-    bg_pool_h3 = None   # H3 cell index parallel to bg_pool rows
-    rand_pool_h3 = None  # H3 cell index parallel to rand_pool rows
     if bg_sampling == "target_group":
         if bg_csv is not None:
             print(f"loading additional background observations from {bg_csv}")
@@ -467,35 +532,6 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
             rand_pool_raw = np.array(rand_locs).astype(np.float32)
             print(f" random pool ready")
 
-        effort_scale = config.get("effort_scale", 0.0)
-        if effort_scale > 0:
-            H3_RES = 4
-            print(f" pre-computing H3-{H3_RES} cell→species lookup from training data...")
-            cell_to_species_sets = defaultdict(set)
-            for i in range(len(locs)):
-                cell = h3.geo_to_h3(float(locs[i, 1]), float(locs[i, 0]), H3_RES)
-                cell_to_species_sets[cell].add(int(class_ids[i]))
-            # store as numpy arrays for vectorized fancy indexing per step
-            cell_to_species = {
-                cell: np.array(list(species), dtype=np.int32)
-                for cell, species in cell_to_species_sets.items()
-            }
-            print(f"  {len(cell_to_species):,} occupied H3 cells")
-
-            print(f" pre-computing H3 cells for bg pool ({len(bg_pool_raw):,} points)...")
-            bg_pool_h3 = np.array([
-                h3.geo_to_h3(float(bg_pool_raw[i, 1]), float(bg_pool_raw[i, 0]), H3_RES)
-                for i in range(len(bg_pool_raw))
-            ])
-            if rand_pool is not None:
-                print(f" pre-computing H3 cells for rand pool ({len(rand_locs):,} points)...")
-                rand_locs_np = np.array(rand_locs)
-                rand_pool_h3 = np.array([
-                    h3.geo_to_h3(float(rand_locs_np[i, 1]), float(rand_locs_np[i, 0]), H3_RES)
-                    for i in range(len(rand_locs_np))
-                ])
-            print(f" effort weighting pre-computation done")
-
     # resolve focal taxon IDs → class indices
     focal_class_ids = None
     if focal_taxa is not None:
@@ -517,19 +553,39 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         print(f" oversample_target_exponent={oversample_target_exponent}: "
               f"factor range [{factor.min()}, {factor.max()}] across {len(focal_class_ids)} focal classes")
 
-    # per-focal-species KDTree of that species' own real observations, for the
-    # distance-based range penalty (opposite of pos_weight - punishes confident
-    # predictions far from any known observation of THIS species, independent of
-    # environmental covariate similarity or other species' effort/presence).
-    focal_kdtrees = {}
+    # per-run lookup tables keyed by global H3 res-4 cell id, so the per-step background
+    # weighting runs on-device (see make_train_step):
+    #  - effort weighting: which classes were observed in each cell (their effort weight is 0)
+    #  - range penalty (opposite of pos_weight - punishes confident predictions far from any
+    #    known observation of THIS species, independent of environmental covariate similarity
+    #    or other species' effort/presence): penalty per cell centroid for each focal class
+    H3_RES = 4
     RANGE_PENALTY_NORM_DEG = 10.0   # ~1000km at the equator
     RANGE_PENALTY_CAP = 5.0
-    if range_penalty_scale > 0 and focal_class_ids:
-        print(f" building per-focal-species KDTrees for range penalty (scale={range_penalty_scale})...")
-        for fc in focal_class_ids:
-            fc_locs = locs[class_ids == fc]
-            focal_kdtrees[fc] = cKDTree(fc_locs)
-            print(f"  class {fc}: {len(fc_locs)} points")
+    effort_scale = config.get("effort_scale", 0.0)
+    use_effort = effort_scale > 0 and bg_sampling == "target_group"
+    use_range_penalty = range_penalty_scale > 0 and bool(focal_class_ids)
+    cell_to_id = cell_species = cell_range_penalty = None
+    bg_pool_cells = rand_pool_cells = None
+    if use_effort or use_range_penalty:
+        cells = [c for r0 in sorted(h3.get_res0_indexes()) for c in sorted(h3.h3_to_children(r0, H3_RES))]
+        cell_to_id = {c: i for i, c in enumerate(cells)}
+        print(f" pre-computing H3-{H3_RES} cell ids ({len(cells):,} cells) for training points...")
+        train_cells = h3_cell_ids(locs, cell_to_id, H3_RES)
+        if bg_sampling == "target_group":
+            bg_pool_cells = train_cells if bg_csv is None else h3_cell_ids(bg_pool_raw, cell_to_id, H3_RES)
+            if rand_pool is not None:
+                rand_pool_cells = h3_cell_ids(rand_pool_raw, cell_to_id, H3_RES)
+        if use_effort:
+            print(f" building cell→species lookup for effort weighting (effort_scale={effort_scale})...")
+            cell_species = build_cell_species(train_cells, class_ids, len(cells))
+        if use_range_penalty:
+            print(f" building range penalty table for {len(focal_class_ids)} focal classes "
+                  f"(scale={range_penalty_scale})...")
+            cell_range_penalty = tf.constant(build_cell_range_penalty(
+                cells, focal_class_ids, locs, class_ids, range_penalty_scale,
+                RANGE_PENALTY_NORM_DEG, RANGE_PENALTY_CAP,
+            ))
 
     if focal_head_dim > 0:
         if not focal_class_ids:
@@ -599,7 +655,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)
 
     # IndependentPerClassHead's own W1/b1/W2/b2 get a separate, unclipped optimizer - see
-    # apply_gradient's docstring for why: grad_clip_value AND the main optimizer's own clipnorm
+    # make_train_step's docstring for why: grad_clip_value AND the main optimizer's own clipnorm
     # both operate on these tensors as if they were a single shared parameter (which they are,
     # as a matter of storage - one batched tensor per layer, shape (num_classes, ...)) even
     # though by construction there is zero cross-class coupling in what they represent. Both
@@ -670,6 +726,13 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
 
     pos_weight = tf.constant(pos_weight_np, dtype=tf.float32)
 
+    train_step = make_train_step(
+        optimizer, logits_model, bg_base_weight=bg_base_weight, grad_clip_value=grad_clip_value,
+        head_optimizer=head_optimizer, head_weight_refs=head_weight_refs, effort_col=EFFORT_COL,
+        effort_scale=effort_scale if use_effort else 0.0, cell_species=cell_species,
+        focal_cols=focal_class_ids, cell_range_penalty=cell_range_penalty, jit_compile=jit_compile,
+    )
+
     prev_epoch_loss = None
     prev_prev_epoch_loss = None
 
@@ -701,73 +764,23 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 n_rand = batch_size_actual - n_tg
                 tg_idx = np.random.randint(0, len(bg_pool), size=n_tg)
                 parts = [bg_pool[tg_idx]]
-                raw_parts = [bg_pool_raw[tg_idx]] if focal_kdtrees else None
-                batch_h3 = list(bg_pool_h3[tg_idx]) if bg_pool_h3 is not None else None
+                cell_parts = [bg_pool_cells[tg_idx]] if bg_pool_cells is not None else None
                 if n_rand > 0 and rand_pool is not None:
                     rand_idx = np.random.randint(0, len(rand_pool), size=n_rand)
                     parts.append(rand_pool[rand_idx])
-                    if raw_parts is not None:
-                        raw_parts.append(rand_pool_raw[rand_idx])
-                    if rand_pool_h3 is not None:
-                        batch_h3.extend(rand_pool_h3[rand_idx])
+                    if cell_parts is not None:
+                        cell_parts.append(rand_pool_cells[rand_idx])
                 fake_x = tf.constant(np.concatenate(parts, axis=0))
-                fake_raw = np.concatenate(raw_parts, axis=0) if raw_parts is not None else None
+                bg_cells = tf.constant(np.concatenate(cell_parts)) if cell_parts is not None else None
             else:
                 rand_loc = make_rand_samples_tf(batch_size_actual)
                 fake_x = encoder.encode(rand_loc, normalize=False)
-                fake_raw = np.array(rand_loc) if focal_kdtrees else None
-                batch_h3 = None
-
-            effort_scale = config.get("effort_scale", 0.0)
-            if effort_scale > 0 and batch_h3 is not None:
-                # build (B_bg, K) weight matrix: effort * (1 - species_present)
-                # species present in the H3 cell → weight 0, absent → weight = effort
-                # NOTE: effort is raster channel EFFORT_RASTER_CHANNEL, NOT the last encoded
-                # column - that assumption broke in v6 when 19 coast_dist*bio interaction
-                # channels were appended AFTER effort in the raster, making channel 22 no
-                # longer last. fake_x[:, -1] silently grabbed the last interaction channel
-                # instead (range ~[-0.6, 3.4], unlike effort's true [0,1]), corrupting
-                # effort_bg_matrix with negative "effort" values since v6. EFFORT_COL is the
-                # correct fixed index.
-                effort_vals = fake_x[:, EFFORT_COL].numpy()  # normalized effort [0,1]
-                species_mask = np.ones((batch_size_actual, num_classes), dtype=np.float32)
-                for j, cell in enumerate(batch_h3):
-                    idxs = cell_to_species.get(cell)
-                    if idxs is not None:
-                        species_mask[j, idxs] = 0.0  # vectorized: zero all present species at once
-                effort_bg_matrix = effort_scale * effort_vals[:, None] * species_mask
-            else:
-                effort_bg_matrix = None
-
-            if focal_kdtrees and fake_raw is not None:
-                # opposite of pos_weight: extra absence penalty scaled by distance from
-                # each focal species' own nearest real observation, independent of
-                # covariate similarity or other species' effort
-                range_penalty_matrix = np.zeros((batch_size_actual, num_classes), dtype=np.float32)
-                for fc, tree in focal_kdtrees.items():
-                    dist_deg, _ = tree.query(fake_raw)
-                    range_penalty_matrix[:, fc] = (
-                        np.minimum(dist_deg / RANGE_PENALTY_NORM_DEG, RANGE_PENALTY_CAP)
-                        * range_penalty_scale
-                    )
-                effort_bg_matrix = (
-                    range_penalty_matrix if effort_bg_matrix is None
-                    else effort_bg_matrix + range_penalty_matrix
+                bg_cells = (
+                    tf.constant(h3_cell_ids(np.array(rand_loc), cell_to_id, H3_RES))
+                    if cell_to_id is not None else None
                 )
 
-            loss = apply_gradient(
-                optimizer,
-                logits_model,
-                x_batch_train,
-                y_batch_train,
-                fake_x,
-                pos_weight,
-                effort_bg_matrix=effort_bg_matrix,
-                bg_base_weight=bg_base_weight,
-                grad_clip_value=grad_clip_value,
-                head_optimizer=head_optimizer,
-                head_weight_refs=head_weight_refs,
-            )
+            loss = train_step(x_batch_train, y_batch_train, fake_x, pos_weight, bg_cells)
 
             global_step = (epoch * num_train_steps_per_epoch) + step
             if step % 10 == 0:
