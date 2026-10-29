@@ -2,7 +2,7 @@ import tensorflow as tf
 
 
 def sinr_loss(y_true, logits, logits_bg, pos_weight, effort_bg_matrix=None, alpha=1.0, bg_base_weight=1.0,
-              bg_effort=None, present_idx=None, focal_cols=None, bg_range_penalty=None):
+              bg_effort=None, present_idx=None, present_mask=None, focal_cols=None, bg_range_penalty=None):
     """
     SINR loss: positive examples + random background locations.
 
@@ -42,6 +42,8 @@ def sinr_loss(y_true, logits, logits_bg, pos_weight, effort_bg_matrix=None, alph
       bg_effort:        (B_bg,) effort_scale * effort[j], applied to every species at row j.
       present_idx:      (P, 2) int64 (row, class) pairs where the class IS present in row j's
                         H3 cell - their effort weight is subtracted back out.
+      present_mask:     optional (P,) 1/0 weights for present_idx, so it can be padded to a
+                        fixed length (needed under XLA).
       focal_cols:       (F,) class indices that get a range penalty.
       bg_range_penalty: (B_bg, F) extra absence weight for those columns.
     Pass either effort_bg_matrix or the sparse arguments, not both.
@@ -70,8 +72,10 @@ def sinr_loss(y_true, logits, logits_bg, pos_weight, effort_bg_matrix=None, alph
         weight_row = bg_base_weight + (bg_effort if bg_effort is not None else 0.0)
         total_bg = tf.reduce_sum(tf.reshape(weight_row, [-1, 1]) * loss_bg)
         if bg_effort is not None and present_idx is not None:
-            present_loss = tf.gather_nd(loss_bg, present_idx)
-            total_bg -= tf.reduce_sum(present_loss * tf.gather(bg_effort, present_idx[:, 0]))
+            present_w = tf.gather(bg_effort, present_idx[:, 0])
+            if present_mask is not None:
+                present_w *= present_mask
+            total_bg -= tf.reduce_sum(tf.gather_nd(loss_bg, present_idx) * present_w)
         if bg_range_penalty is not None:
             total_bg += tf.reduce_sum(tf.gather(loss_bg, focal_cols, axis=1) * bg_range_penalty)
         return tf.reduce_mean(loss_pos) + total_bg / tf.cast(tf.size(loss_bg), total_bg.dtype)

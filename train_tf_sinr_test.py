@@ -52,7 +52,7 @@ def load_sinr_dataset_from_npy(prefix):
 
 def make_train_step(optimizer, model, bg_base_weight=1.0, grad_clip_value=None, head_optimizer=None,
                     head_weight_refs=None, effort_col=None, effort_scale=0.0, cell_species=None,
-                    focal_cols=None, cell_range_penalty=None, jit_compile=False):
+                    focal_cols=None, cell_range_penalty=None, jit_compile=False, bg_batch_size=None):
     """Returns a compiled train_step(x, ys, fake_x, pos_weight, bg_cells) -> loss.
 
     `model` here must be the logits-output view (pre-sigmoid) so sinr_loss can compute a
@@ -66,6 +66,11 @@ def make_train_step(optimizer, model, bg_base_weight=1.0, grad_clip_value=None, 
       bg_cells:           (B_bg,) global H3 cell id of each background point (None if unused).
     effort_scale > 0 with cell_species enables effort weighting; cell_range_penalty enables the
     range penalty.
+
+    jit_compile: XLA-compiles the model/loss/optimizer part of the step. XLA needs static shapes,
+    and the number of present (row, class) pairs varies per batch, so with effort weighting the
+    pair lookup runs outside the XLA region and is padded to a fixed upper bound
+    (bg_batch_size * the most classes in any one cell), with padded pairs masked out.
 
     head_optimizer/head_weight_refs: if given, IndependentPerClassHead's own W1/b1/W2/b2 get
     updated through a SEPARATE optimizer with no clipping at all, instead of through `optimizer`
@@ -89,25 +94,44 @@ def make_train_step(optimizer, model, bg_base_weight=1.0, grad_clip_value=None, 
         head_optimizer.build(head_vars)
     use_effort = effort_scale > 0 and cell_species is not None
     focal_cols_t = tf.constant(focal_cols, dtype=tf.int32) if cell_range_penalty is not None else None
+    max_pairs = None
+    if use_effort and jit_compile:
+        if bg_batch_size is None:
+            raise ValueError("jit_compile with effort weighting needs bg_batch_size")
+        max_pairs = bg_batch_size * int(tf.reduce_max(cell_species.row_lengths()))
+
+    @tf.function(reduce_retracing=True)
+    def train_step(x, ys, fake_x, pos_weight, bg_cells):
+        present_idx = present_mask = None
+        if use_effort:
+            present = tf.gather(cell_species, bg_cells)
+            present_idx = tf.stack(
+                [present.value_rowids(), tf.cast(present.flat_values, tf.int64)], axis=1
+            )
+            if max_pairs is not None:
+                n_pairs = tf.shape(present_idx)[0]
+                present_mask = tf.ensure_shape(
+                    tf.concat([tf.ones([n_pairs]), tf.zeros([max_pairs - n_pairs])], axis=0), [max_pairs]
+                )
+                present_idx = tf.ensure_shape(
+                    tf.pad(present_idx, [[0, max_pairs - n_pairs], [0, 0]]), [max_pairs, 2]
+                )
+        return core_step(x, ys, fake_x, pos_weight, bg_cells, present_idx, present_mask)
 
     @tf.function(reduce_retracing=True, jit_compile=jit_compile)
-    def train_step(x, ys, fake_x, pos_weight, bg_cells):
+    def core_step(x, ys, fake_x, pos_weight, bg_cells, present_idx, present_mask):
         with tf.GradientTape() as tape:
             logits = model(x[:, :-1], training=True)
             fake_logits = model(fake_x[:, :-1], training=True)
-            bg_effort = present_idx = bg_range_penalty = None
+            bg_effort = bg_range_penalty = None
             if use_effort:
                 bg_effort = effort_scale * fake_x[:, effort_col]
-                present = tf.gather(cell_species, bg_cells)
-                present_idx = tf.stack(
-                    [present.value_rowids(), tf.cast(present.flat_values, tf.int64)], axis=1
-                )
             if cell_range_penalty is not None:
                 bg_range_penalty = tf.cast(tf.gather(cell_range_penalty, bg_cells), tf.float32)
             loss = sinr_loss(
                 ys, logits, fake_logits, pos_weight, bg_base_weight=bg_base_weight,
-                bg_effort=bg_effort, present_idx=present_idx, focal_cols=focal_cols_t,
-                bg_range_penalty=bg_range_penalty,
+                bg_effort=bg_effort, present_idx=present_idx, present_mask=present_mask,
+                focal_cols=focal_cols_t, bg_range_penalty=bg_range_penalty,
             )
 
         gradients = tape.gradient(loss, weights)
@@ -731,6 +755,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         head_optimizer=head_optimizer, head_weight_refs=head_weight_refs, effort_col=EFFORT_COL,
         effort_scale=effort_scale if use_effort else 0.0, cell_species=cell_species,
         focal_cols=focal_class_ids, cell_range_penalty=cell_range_penalty, jit_compile=jit_compile,
+        bg_batch_size=config["batch_size"],
     )
 
     prev_epoch_loss = None
