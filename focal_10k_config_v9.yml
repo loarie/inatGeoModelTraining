@@ -1,0 +1,70 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v9.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.0 --focal_oversample 5 --range_penalty_scale 1.5 --no_wandb
+#
+# (v1-v6 history: see focal_10k_config_v6.yml. v7: see focal_10k_config_v7.yml/v8 comments below
+# for the pos_weight/effort_scale/bg_tg_fraction tuning that fixed Ant but spread the Africa/
+# Central-Asia extrapolation artifact.)
+#
+# v8 vs v7: added a distance-based range penalty (opposite of pos_weight) - per-focal-species
+# KDTree of that species' own real observations; background points far from a species' own range
+# get extra absence penalty, independent of covariate similarity or other species' effort.
+# Implemented in train_tf_sinr_test.py (new --range_penalty_scale flag, per-step KDTree query,
+# folded into effort_bg_matrix) - sinr_loss.py unchanged. range_penalty_scale=3.0, internal cap
+# 5.0x (so up to 16x total background weight for very-far focal-species predictions). Result:
+# proved the mechanism works - produced FULLY clean states (all 7 species, no artifact) at
+# epochs 1-3, 7, 8, and 11 - but training was unstable: per-epoch loss bounced sharply within
+# every epoch (peak ~2.8x the trough, consistently around 65-75% through each epoch), and
+# Lewisia's artifact oscillated in and out (clean at 7/8/11, back at 4/5/14) rather than
+# resolving permanently. Landed on a relapsed (artifact-present) state at the final epoch 20 by
+# chance of the oscillation, despite the mechanism being proven to work at other checkpoints.
+# Root cause: no gradient clipping in the optimizer, combined with range_penalty_scale=3.0 being
+# large enough (up to 16x background weight) to make the loss landscape spiky specifically for
+# the 7 focal-species columns, causing the model to overshoot rather than settle.
+#
+# v9 vs v8: stability fix, not a mechanism change - (1) added clipnorm=1.0 to the Adam optimizer
+# (standard fix for gradient-spike-driven oscillation, doesn't require precisely tuning the new
+# term's magnitude), (2) halved range_penalty_scale 3.0->1.5 and lowered its internal cap
+# 5.0->3.0 (train_tf_sinr_test.py RANGE_PENALTY_CAP constant), so the new term is gentler while
+# still directionally the same mechanism that already proved it can produce clean results.
+# pos_weight/effort_scale/bg_tg_fraction unchanged from v7/v8 to preserve the Ant improvement.
+# Goal: reach a clean, STABLE state and hold it through to epoch 20, rather than oscillate.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v9.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 6.0
+
+sinr_hyperparams:
+    pos_weight: 2.0

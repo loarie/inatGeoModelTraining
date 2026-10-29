@@ -161,5 +161,22 @@ cython_debug/
 wandb/
 config.yml
 *.yml
+!focal_10k_config_v*.yml
 saved_models/
 elevation_h3_resolution6.csv
+
+# training/eval outputs and local data (keep out of git; share via external storage)
+.DS_Store
+*.keras
+*.npy
+!group500_taxa*.npy
+*.pkl
+*.png
+*.geojson
+*.csv
+*.tif
+*.tiff
+*.zip
+bioclim_tifs/
+vector_exports*/
+Untitled*.ipynb

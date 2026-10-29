@@ -1,0 +1,97 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v27.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --bg_base_weight 1.5 --covariate_penalty_scale 3.0 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v22 = ACCEPTED BASELINE (bugfix + effort_scale=5.0 + bg_base_weight=1.5, no hard-negative
+# mining), copied to baseline_v22_accepted.keras. Specificity: Pika 0.990, Millipede 0.919,
+# Lily 0.964, Crab 0.939, Lewisia 0.942, Amorph 0.943, Ant 0.743 (avg ~0.920).
+#
+# v23/v24/v25 (bg_base_weight, range_penalty_scale, hard_neg_scale each pushed up independently)
+# were all clear regressions vs v22. See those configs' comments. Not pursued further.
+#
+# v26 (added --covariate_penalty_scale 3.0: per-focal-species bio4/temp-seasonality range,
+# penalizing background points whose seasonality falls outside what the species was ever
+# observed in - see that config's comments for the full diagnosis of Millipede's Rockies false
+# positives) was ALSO a regression, and a more informative one: it made the TARGET problem worse
+# (Millipede's CO Rockies prediction went 0.838->0.960, not down), avg specificity dropped
+# ~0.920->~0.858, and a pre-v22 Eurasia climate-analog artifact (see v6-v8 history) came back for
+# species that didn't have it in v22. Root cause hypothesis: v26 SUMMED range_penalty_matrix and
+# covariate_penalty_matrix, so a background point that was both geographically far AND
+# climate-mismatched could hit up to ~36x combined background weight - spikier than the global
+# clipnorm=1.0 can rescale without dampening other gradient signal in that step (same class of
+# problem v8->v9 fixed once already for range_penalty alone).
+#
+# v27 vs v26: SAME covariate_penalty_scale=3.0, ONE change - range_penalty_matrix and
+# covariate_penalty_matrix are now combined with max(), not +. Both measure "how implausible is
+# this location for this species" (geographic vs. climatic), so max() keeps each mechanism's own
+# worst case (<=5.0x its own scale) instead of compounding them - the effort_scale term (a
+# genuinely different signal: survey effort for OTHER species here) stays additive on top of
+# whichever of range/covariate penalty is larger, unchanged from v22/v26. This isolates the
+# stacking hypothesis: if v27 fixes the Rockies problem and doesn't resurrect the Eurasia
+# artifact, the mechanism was sound and v26's failure was purely a composition/gradient-scale
+# issue. If v27 ALSO regresses, the covariate-penalty mechanism itself is the problem, not just
+# how it was combined - four failed absence-pressure levers (v23-v26) plus this would be a
+# strong signal to stop pursuing loss-side penalties on v22 and try something structurally
+# different instead.
+#
+# v27 RESULT: also a clear regression (avg specificity ~0.856 vs v22's ~0.920, nearly identical
+# magnitude to v26's ~0.858). max() DID soften the Eurasia side-effect vs v26's sum (E
+# Mediterranean: Lily 0.985->0.414, Crab 0.603->0.298, Lewisia 0.664->0.417, Amorph 0.864->0.211)
+# but did NOT eliminate it, and did NOT fix the target problem - Millipede's Rockies transect got
+# WORSE STILL (CO Rockies 0.838(v22)->0.960(v26)->0.999(v27); ID/WY ->1.000). Conclusion: the
+# stacking/clipnorm hypothesis was only partially right (it explains why max() softened the
+# Eurasia symptom) but doesn't explain why the mechanism fails at its actual target - the
+# covariate_penalty_scale mechanism itself, not just its composition with range_penalty, doesn't
+# work as hypothesized for fixing Millipede's Rockies false positives. Not pursuing
+# covariate_penalty_scale further in any combination; v27 checkpoints deleted.
+#
+# Final tally: v23 (bg_base_weight), v24 (range_penalty_scale), v25 (hard_neg_scale), v26/v27
+# (covariate_penalty_scale, two combination modes) - 5 distinct loss-side "more absence pressure"
+# mechanisms across 6 training runs, all regressions vs v22. Stopping this line of investigation.
+# v22 remains the accepted baseline. Next direction (see focal_10k_config_v26.yml's closing note):
+# dedicated per-species capacity (e.g. a small focal-species-specific embedding/head) instead of
+# more loss engineering, since Millipede's bio4 signal is real (0% distributional overlap with the
+# false-positive region) but isn't being learned - a capacity/attention problem, not a
+# loss-weighting problem, when one 512-dim hidden layer is shared across 10,007 classes.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v27.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

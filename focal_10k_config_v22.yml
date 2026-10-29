@@ -1,0 +1,68 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v22.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --bg_base_weight 1.5 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v20 = ACCEPTED BASELINE (bugfix + effort_scale=5.0, no hard-negative mining), copied to
+# baseline_v20_accepted.keras. Specificity: Pika 0.995, Millipede 0.901, Lily 0.874, Crab 0.950,
+# Lewisia 0.912, Amorph 0.937, Ant 0.754 (avg ~0.903).
+#
+# v21 (effort_scale=4.0, interpolating between v18's 3.0 and v20's 5.0) did NOT cleanly improve
+# on Millipede as hoped - it got WORSE (0.901->0.870), and Crab/Lewisia/Amorph also regressed
+# vs v20, while only Lily/Ant improved. Avg specificity back down to ~0.865, same as v18.
+# Conclusion: the relationship between effort_scale and per-species specificity is noisy/
+# non-monotonic across individual training runs (each run = one seed, one convergence path) -
+# fine interpolation between nearby effort_scale values isn't a reliable lever. Not pursuing
+# further effort_scale tuning for now.
+#
+# v22 vs v20: NEW lever, not another effort_scale interpolation - bg_base_weight 1.0->1.5. This
+# is the flat, unconditional absence-pressure floor applied to EVERY background point
+# regardless of effort (see sinr_loss.py) - "if there's no presence evidence at all, it should
+# be hard to predict presence," independent of and in addition to effort-based suppression.
+# Tried once before in v12, but that was NOT a fair test: v12 ran against the buggy effort
+# signal, combined bg_base_weight with a simultaneous pos_weight bump (confounded), and was
+# only evaluated with the misleading sensitivity-only metric (no specificity check existed
+# yet). This run isolates bg_base_weight cleanly on top of v20's already-good, correctly-
+# effort-weighted foundation: pos_weight/effort_scale/range_penalty_scale/clipnorm all
+# unchanged from v20, only bg_base_weight added.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v22.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

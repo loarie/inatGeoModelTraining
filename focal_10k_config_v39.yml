@@ -1,0 +1,82 @@
+# v39: single-variable test of the grad-clipping fix, isolated from everything else.
+#
+# v38 postmortem: after the run completed (26 epochs, 104/500 still stuck despite pos_weight
+# escalating to 144x/capped-112.5x via --pos_weight_adapt), direct gradient inspection on the
+# final checkpoint found the real bottleneck was never pos_weight magnitude - it was
+# grad_clip_value=1.0 AND the optimizer's own clipnorm=1.0, both applied uniformly across ALL
+# trainable weights including IndependentPerClassHead's W1/b1/W2/b2. Measured on the real
+# checkpoint: a boosted class's own-head gradient (b2 specifically) was consistently ~ -pos_weight
+# (e.g. -112.5 at pos_weight=112.5) BEFORE clipping - two to three orders of magnitude past the
+# clip=1.0 bound. Worse: even after element-wise clipping to [-1,1], the FULL per-layer tensor
+# (spanning all 500 classes at once, since it's one batched (500, ...) tensor per layer, not 500
+# separate tensors) still had a norm of 12-60 depending on the tensor, so the optimizer's own
+# clipnorm=1.0 triggered AGAIN and crushed the entire tensor by another 20-60x - meaning every
+# class sharing that tensor (boosted or not, already-converged or not) got its effective gradient
+# crushed by whichever classes had the largest raw gradient in that batch. Increasing pos_weight
+# past roughly 10x had literally zero effect on the actual parameter update once this saturated,
+# which explains everything observed in v38: rescue rate not scaling with weight, and a hard-tail
+# (taxon 133607 clearest example) showing zero sustained improvement despite reaching 144x weight.
+#
+# NEW: IndependentPerClassHead's own parameters (W1/b1/W2/b2) now update through a SEPARATE Adam
+# optimizer with NO clipnorm, and are exempt from --grad_clip_value's element-wise clip (both
+# still apply, unchanged, to the shared backbone - see apply_gradient()'s docstring in
+# train_tf_sinr_test.py for the full reasoning). Neither clip's original justification (stopping
+# one class's gradient from dominating a SHARED parameter, added after v30's actual divergence)
+# applies to the independent head: there is no shared parameter between classes there by
+# construction, so there's nothing for one class to crowd out. Adam's own per-element moment
+# normalization is expected to keep individual steps well-behaved even with very large raw
+# gradients, without needing external clipping - this is exactly the property that makes Adam a
+# reasonable choice for classes with wildly different effective pos_weight.
+#
+# Resumed from v38's FINAL checkpoint (epoch026) and its FINAL pos_weight state (unchanged,
+# carried over via --pos_weight_init_file) - deliberately changing only this one thing so any
+# difference in outcome is attributable to the clipping fix alone, not a different starting point
+# or weight schedule. --pos_weight_adapt stays on with the same settings as v38.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v39.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 40 \
+#     --focal_taxa <same 500 taxon_ids as v33-v38> \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --no_wandb \
+#     --pos_weight_init_file focal_10k_model_v38.epoch026.pos_weight.npy \
+#     --pos_weight_adapt --pos_weight_adapt_every 3 --pos_weight_adapt_threshold 0.05 \
+#     --pos_weight_adapt_factor 2.0 --pos_weight_adapt_max 50.0 \
+#     --start_epoch 26
+#
+# EVALUATE: same protocol - track the 104-class stuck population from v38's final state, plus
+# specifically taxon 133607 (the cleanest zero-response-under-boosting case) as the sharpest
+# single test of whether this was really the mechanism.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 40
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v39.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

@@ -1,0 +1,31 @@
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.98
+num_epochs: 10
+batch_size: 512
+hard_cap: 5000
+subsample_each_epoch: False
+model_save_name: "test_pika_model.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 256
+effort_scale: 4.0
+
+sinr_hyperparams:
+    pos_weight: 1

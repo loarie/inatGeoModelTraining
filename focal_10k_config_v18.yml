@@ -1,0 +1,69 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v18.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 --no_wandb
+#
+# IMPORTANT: evaluate with BOTH visualize_combined.py (sensitivity - are real presence points
+# caught) AND check_specificity.py (specificity - are genuine high-effort true absences
+# correctly predicted absent). Sensitivity alone is misleading: it only reflects scores at real
+# presence points and says nothing about over-prediction/false positives. This was learned the
+# hard way at v17.
+#
+# v11 = accepted baseline (bug-era effort, effort_scale=7.0): strong on BOTH sensitivity and
+# specificity (check_specificity.py: Pika 1.000, Millipede 0.963, Lily 0.928, Crab 0.967,
+# Lewisia 0.959, Amorph 0.931, Ant 0.765 specificity at 3000+-obs true-absence cells).
+#
+# v16 = bugfix, same hyperparameters as v11 (effort_scale=7.0 against TRUE effort): worse
+# sensitivity across the board - true effort in realistic mixed batches (65% real-observation
+# locations, so already effort-dense; mean 0.42, median 0.52) is far less sparse than assumed,
+# so effort_scale=7 against it produces much stronger, more pervasive suppression than v11 was
+# ever tuned against.
+#
+# v17 = bugfix, effort_scale dropped to 1.0: excellent sensitivity (Millipede/Lily hit 1.000,
+# no Europe/Asia extrapolation artifacts) BUT specificity collapsed (Pika 1.000->0.758, Lewisia
+# 0.959->0.772, Amorph 0.931->0.843 etc.) - confirmed visually (over-broad, blobby ranges) and
+# numerically via check_specificity.py. Overcorrected: too little absence suppression.
+#
+# v18 vs v17/v11: effort_scale=3.0 - midpoint between v17's 1.0 (too weak, bad specificity) and
+# v11's 7.0 (the accepted baseline, itself now known to be tuned against a bug, but with
+# genuinely good specificity). Goal: find a value against TRUE effort that matches or beats
+# v11 on BOTH sensitivity and specificity, not just one. pos_weight/range_penalty_scale/clipnorm
+# unchanged from v11/v17.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v18.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 3.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

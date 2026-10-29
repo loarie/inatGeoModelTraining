@@ -1,0 +1,62 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v21.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v20 = NEW ACCEPTED BASELINE (bugfix + effort_scale=5.0, no hard-negative mining), copied to
+# baseline_v20_accepted.keras. Ablation vs v19 (effort_scale=5.0 + hard_neg_scale=2.0) proved
+# hard-negative mining was causing the Crab/Lewisia regression (removing it: Crab 0.779->0.950,
+# Lewisia 0.801->0.912, both close to v11). Amorph/Ant kept their gains from effort_scale alone.
+# Specificity: Pika 0.995, Millipede 0.901, Lily 0.874, Crab 0.950, Lewisia 0.912, Amorph 0.937,
+# Ant 0.754 (avg ~0.903, best bug-fixed model yet, closing in on v11's ~0.930). One regression
+# vs v18/v19: Millipede dropped from 0.963 to 0.901 - not explained by hard-negative mining
+# (v19 also had effort_scale=5.0 and Millipede was FINE there at 0.975), so it's specifically an
+# effort_scale=5.0 (vs 3.0) side effect on Millipede.
+#
+# v21 vs v20: effort_scale 5.0->4.0, no other changes. Millipede was fine at effort_scale=3.0
+# (v18: 0.963) and 5.0-with-hard-neg (v19: 0.975), but dropped at 5.0-without-hard-neg (v20:
+# 0.901) - narrowing in on whether 4.0 keeps Crab/Lewisia/Amorph/Ant's gains from v20 while
+# recovering Millipede's specificity, or whether Millipede's v20 dip is more specifically tied
+# to the interaction with hard-negative mining being absent (in which case 4.0 alone may not
+# fix it). Genuinely open question - not assumed to work, just the next natural interpolation
+# point given v18(3.0)/v20(5.0) bracket it.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v21.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 4.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

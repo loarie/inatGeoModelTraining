@@ -1,0 +1,80 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v28.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --bg_base_weight 1.5 --focal_head_dim 64 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v22 = ACCEPTED BASELINE (bugfix + effort_scale=5.0 + bg_base_weight=1.5, no hard-negative
+# mining), copied to baseline_v22_accepted.keras. Specificity: Pika 0.990, Millipede 0.919,
+# Lily 0.964, Crab 0.939, Lewisia 0.942, Amorph 0.943, Ant 0.743 (avg ~0.920).
+#
+# v23/v24/v25/v26/v27: 5 distinct loss-side "more absence pressure" mechanisms across 6 training
+# runs (bg_base_weight, range_penalty_scale, hard_neg_scale, covariate_penalty_scale x2 combination
+# modes) - ALL regressed vs v22. See those configs' comments, especially v26/v27 for the full
+# Millipede-Rockies root-cause diagnosis: bio4 (temperature seasonality) cleanly separates
+# Millipede's true coastal range from the Rockies false-positive band (0% distributional overlap
+# across 13,206 real obs vs. 3,808 high-elevation grid cells), but the model wasn't learning to
+# use that signal for this one sparse focal species - and no amount of extra loss-side penalty on
+# background points fixed it (in fact several made it and/or other species measurably worse).
+# Conclusion reached at the end of v27: this is a capacity/attention problem, not a
+# loss-weighting problem - one 512-dim hidden layer shared across 10,007 classes, with only
+# 13,206 Millipede presence points to compete for gradient budget in it, may simply not be able
+# to dedicate enough of itself to a subtle-but-real signal for one rare class. Stopped pursuing
+# loss-side penalties; v22 remains the accepted baseline for that entire line of work.
+#
+# v28 vs v22: a structural (architecture) change instead of another loss term - new
+# --focal_head_dim flag (lib/models/geo_model_net.py: make_geo_model_net_focal_head /
+# FocalScatterAdd, train_tf_sinr_test.py wiring; sinr_loss.py unchanged). Focal taxa get a small
+# SEPARATE 2-layer head (focal_head_dim=64 hidden units) that takes the raw input features
+# directly, not the shared 512-dim backbone representation every other class relies on - so
+# learning to use e.g. bio4 for Millipede doesn't have to compete for capacity/gradient budget
+# with the other ~10,000 classes. The focal head's final layer is zero-initialized, so at epoch 0
+# it's a pure no-op (predictions identical to the shared backbone alone) and only grows influence
+# as training finds it useful - deliberately conservative, shouldn't destabilize early training
+# the way v9's un-clipped range_penalty overshoot did. Non-focal classes are completely
+# unaffected (their logits come only from the shared backbone, exactly as in v22). Kept
+# range_penalty_scale=3.0/bg_base_weight=1.5/effort_scale=5.0/pos_weight=2.25 identical to v22 so
+# this isolates the ONE new variable (focal_head_dim) against the accepted baseline, same
+# ablation discipline as every prior version. Chose focal_head_dim=64 as a modest first size -
+# small enough not to let the focal head become a de facto second full model, large enough for a
+# 2-layer MLP to learn a real (if subtle) covariate-space decision boundary per focal species.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v28.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

@@ -1,0 +1,101 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v7.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.0 --focal_oversample 5 --no_wandb
+#
+# v4 vs v3: v3 fixed the loss-bouncing problem (hidden_dim 256->512, lr_decay 0.98->0.93).
+# v4 additionally fixes an ocean false-positive bug by adding an explicit land_mask channel
+# (1=land, 0=ocean, derived from the bio1 NaN footprint) since NaN->0.0 fill made ocean pixels
+# look like "perfectly average land climate" on all 19 bio channels.
+#
+# v5 vs v4: v4 still showed a persistent ocean false-positive blob for Millipede (offshore of
+# Haida Gwaii, BC) that did not improve from epoch 20->23. Root cause was contradictory
+# training DATA, not the encoder: 44/13,250 Millipede and 146/7,678 Crab presence points sit
+# directly on ocean-classified pixels (~9km raster resolution can't resolve Haida Gwaii's
+# fjord-heavy coastline), and with --focal_oversample 5 those points get replicated ~5x,
+# directly contradicting land_mask at that exact spot. Cleaned via a per-class land/ocean ratio
+# test (>=90% or <=10% on one side with n>=30 -> drop the minority side as noise; 10-90% mixed
+# classes left untouched to protect genuinely amphibious species). Removed 31,092/5,055,725
+# points (0.615%) across 9,568 affected classes. New training set:
+# train_10k_focal_clean_{locs,class_ids,unique_taxa}.npy. Fixed the Millipede ocean blob by
+# epoch 3 (no re-emergence, unlike v4's epoch 20->23).
+#
+# v6 vs v5: v5 still showed Crab predicting confidently deep in the Amazon interior instead of
+# hugging the coast (real crab.csv observations are ALL within scaled coast_dist 0.004-0.008 of
+# the coast - this is not a data problem). coast_distance itself separates these cases cleanly
+# (0.004 at a real coastal crab point vs 0.51 in the Amazon interior - ~100x), and background
+# absence pressure in the Amazon is dense (>24k random + >13k real presence points from 986
+# other species), so this isn't a data-coverage gap either. Diagnosis: the shared MLP body +
+# per-species linear embedding readout can't easily represent a species-specific interaction
+# ("near-coast AND tropical climate") when thousands of other species are legitimately
+# tropical-interior and dominate how the shared embedding organizes climate signal. Borrowed
+# Maxent's product-feature approach: added explicit coast_distance x bio{1..19} interaction
+# channels (19 new channels) so "how far inland, given the local climate" is a direct input
+# rather than something the network has to construct from a linear combination of a shared,
+# heavily-contended embedding. New raster: bioclim_coast_effort_landmask_interact_scaled.npy
+# (42ch: elev, bio1-19, coast_dist, land_mask, effort, coast_dist*bio1-19). Fixed the Crab
+# Amazon-interior blob (clean coastal range by epoch 3, held stable through epoch 20). Also
+# surfaced a new, separate extrapolation artifact: Millipede/Lewisia show false-positive bands
+# in Africa/Central Asia (climatically analogous but biogeographically disjunct regions) that
+# grew rather than faded over 20 epochs. Confirmed via a distance-to-nearest-observation raster
+# check that these zones are NOT data-sparse in an absolute sense (~52-158km from the nearest
+# observation of ANY species, closer than the global median of ~279km) - ruled out as a
+# feature-engineering fix (tried building bioclim_coast_effort_landmask_interact_dist_scaled.npy
+# with this feature, abandoned - doesn't discriminate the failure zones). This is model
+# generalization behavior (climate-similarity extrapolation across disjunct geography), not a
+# data-coverage gap - best addressed by post-hoc geographic masking of predictions, not a
+# training-time fix. Left OUT of v7 (raster unchanged from v6).
+#
+# v7 vs v6: v6 also surfaced a calibration issue independent of the above two bugs: Lily (and
+# likely others) shows false absences at the southern/warm edge of its real range and false
+# presences at the northern/cool edge when thresholded at 97.5% sensitivity - the general
+# omission/commission tradeoff of a climate-driven continuous surface. Tuned three existing
+# hyperparameters rather than changing the raster or architecture: pos_weight 1.5->2.0 (push
+# harder on fitting true presence points, reducing false absences at range edges), effort_scale
+# 4.0->6.0 (more strongly penalize predicted presence in cells with real observation effort of
+# OTHER species but no observation of the focal species, reducing false presences in
+# well-sampled-but-absent areas), bg_tg_fraction 0.5->0.65 (lean more on real effort-weighted
+# background than uniform-random background, now that the Africa/Central-Asia extrapolation
+# problem is being handled downstream via masking rather than via the random background pool).
+# Ant did not converge in v6 (mean=0.761, p10=0.551 at epoch 20 vs 0.968+ for every other focal
+# species) - carried into v7 as an observation, not a targeted fix; only 180 presence points, may
+# need a dedicated intervention (e.g. per-species oversample) rather than more epochs of this
+# same setup if it's still stuck.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v7.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 6.0
+
+sinr_hyperparams:
+    pos_weight: 2.0

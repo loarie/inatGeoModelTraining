@@ -1,0 +1,64 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v14.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.5 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --hard_neg_scale 2.0 --hard_neg_gamma 2.0 --no_wandb
+#
+# (v10 = accepted baseline: clipnorm=1.0 + range_penalty_scale=3.0/cap=5.0. v11 = pos_weight
+# 2.0->2.25, effort_scale 6.0->7.0 - ACCEPTED, copied to baseline_v11_accepted.keras. v12 =
+# bg_base_weight added - REJECTED, slightly worse than v11 across the board. v13 = hard-negative
+# mining added (sinr_loss.py hard_neg_scale/gamma) - confirmed via direct model-query comparison
+# (v11 vs v13 at v11's own overconfident cells) that it strongly suppresses false positives in
+# LOW-effort/unsampled areas (e.g. Amorph 0.733->0.119 mean at those cells, Lily 0.655->0.075),
+# but only weakly/inconsistently helps the HIGH-effort-but-never-observed case (Ant stayed at
+# 23% false-positive rate in high-effort cells, Lewisia/Pika/Millipede roughly flat or slightly
+# worse there) - likely because the hard-neg boost is driven by the model's own current
+# confidence, which correlates more with large obvious low-effort overextrapolation than with
+# the more subtle overconfidence in well-sampled absent cells.
+#
+# v14 vs v13: priority clarified - both (1) fitting real presence hard (pos_weight, already
+# working) and (2) suppressing false positives specifically where effort is high (the case v13
+# under-delivered on) matter, with the ORIGINAL worry about pushing effort_scale alone (v7-era:
+# "more false positives in low-sampling areas") no longer as much of a blocker now that
+# hard-negative mining is independently covering the low-sampling side. So: push effort_scale
+# further (7.0->10.0) to directly target high-effort false positives, AND push pos_weight
+# further (2.25->2.5) per explicit request, keeping hard_neg_scale/gamma unchanged (2.0/2.0) and
+# range_penalty_scale/cap/clipnorm unchanged from the stable v10/v11/v13 foundation.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v14.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 10.0
+
+sinr_hyperparams:
+    pos_weight: 2.5

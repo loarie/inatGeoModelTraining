@@ -1,0 +1,76 @@
+# v40: clean, from-scratch run of the FULL fixed recipe - the real test of whether the
+# combination of fixes discovered across v35-v39 actually converges cleanly, rather than
+# continuing to resume a model whose Adam optimizer state carries baggage from four separate,
+# progressively-patched training regimes (flat pos_weight -> adaptive-but-clipped ->
+# adaptive-and-unclipped).
+#
+# Everything below was validated independently in v35-v39 - this run bakes ALL of it in from
+# epoch 0 instead of patching it in partway through training:
+#   - IndependentPerClassHead (v35): zero cross-class weight sharing, fixes the shared-bottleneck
+#     collapse that killed v30/v33/v34.
+#   - logits-based sinr_loss (v36, now just how sinr_loss.py works, no flag needed): fixes the
+#     vanishing-gradient trap that a probability-space loss formulation had.
+#   - --pos_weight_adapt (v38): closed-loop, no-manual-curation controller that automatically
+#     escalates pos_weight for any focal class still below threshold, re-checked periodically.
+#   - Correctly-scoped gradient clipping (v39, now automatic whenever IndependentPerClassHead is
+#     present - no flag needed): the independent head's own W1/b1/W2/b2 update through a SEPARATE,
+#     unclipped Adam optimizer, since grad_clip_value's per-element clip and the main optimizer's
+#     own clipnorm were both silently discarding pos_weight boosts past ~10x when applied to a
+#     per-class tensor that has zero real cross-class coupling. This was THE actual bottleneck
+#     behind v38's "hard tail" (e.g. taxon 133607, permanently flat despite 144x weight) - v39
+#     showed it move immediately once unclipped, so that "hard tail" was mostly an artifact, not
+#     evidence of a genuinely separate failure mode.
+#
+# UNLIKE v37 (one-time flat 8x boost, manually curated from a static snapshot) - this run never
+# applies --pos_weight_boost_taxa at all. Every class starts at the flat base pos_weight=2.25 and
+# --pos_weight_adapt discovers and escalates whichever ones need it, automatically, from the
+# first check onward. This is the version of the recipe that could actually generalize to 120k
+# species, where nobody will hand-curate a stuck-list.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v40.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 30 \
+#     --focal_taxa <same 500 taxon_ids as v33-v39> \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --no_wandb \
+#     --pos_weight_adapt --pos_weight_adapt_every 3 --pos_weight_adapt_threshold 0.05 \
+#     --pos_weight_adapt_factor 2.0 --pos_weight_adapt_max 50.0
+#
+# EVALUATE: same protocol as v33-v39 - full 500-group stuck/partial/converged breakdown at every
+# adaptation check, plus specifically watch taxon 9296 (the single worst performer even after the
+# v39 fix, peaked at only 0.057 mean pred) and 133607 (the clearest "looked like a different
+# mechanism, wasn't" case) as the sharpest tests of whether a clean run does better than the
+# patched-together v39 model managed.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 30
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v40.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

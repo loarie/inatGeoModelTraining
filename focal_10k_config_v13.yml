@@ -1,0 +1,69 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v13.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --hard_neg_scale 2.0 --hard_neg_gamma 2.0 --no_wandb
+#
+# (v1-v9: see focal_10k_config_v8.yml/v10.yml. v10 = accepted baseline: clipnorm=1.0 +
+# range_penalty_scale=3.0/cap=5.0. v11 = pos_weight 2.0->2.25, effort_scale 6.0->7.0 on top of
+# v10, clean results for 6/7 species + Ant held at 0.725 (95% sensitivity) - ACCEPTED BASELINE,
+# copied to baseline_v11_accepted.keras.)
+#
+# v12 vs v11: added bg_base_weight (flat, unconditional absence-pressure floor, previously
+# hardcoded to 1.0 inside sinr_loss.py, now exposed) + pushed pos_weight 2.25->2.5. Result: at a
+# fair 95%-sensitivity comparison, v12 was slightly WORSE than v11 across every species,
+# including Ant (0.559 vs 0.725) - bg_base_weight is a blunt instrument that softens confidence
+# everywhere (including near real presence points), not just in the low-sampling gaps it was
+# meant to target. REJECTED - not used going forward.
+#
+# v13 vs v11 (v12 abandoned): reverted bg_base_weight to 1.0 (off) and pos_weight back to 2.25
+# (v11's values). Added a NEW, more surgical mechanism instead: hard-negative mining
+# (sinr_loss.py, new hard_neg_scale/hard_neg_gamma params). Rather than a blanket weight on
+# high-effort-absent cells (which risks starving gradient attention from low-effort cells - the
+# likely cause of v11's "more false positives in low-sampling areas" complaint about
+# effort_scale), this multiplies the EXISTING (bg_base_weight + effort_bg_matrix) weight by
+# (1 + hard_neg_scale * stop_gradient(model's own current prediction)^hard_neg_gamma) - i.e. it
+# only pushes hard where the model is CURRENTLY overconfident about presence at an absence
+# point, and does nothing extra where the model already correctly predicts near-zero. Because
+# it multiplies the existing effort-based weight rather than replacing it, the boost is
+# naturally strongest exactly where effort is already high (satisfying "particularly if there's
+# a lot of effort") without a hard gate and without diluting attention elsewhere.
+# hard_neg_scale=2.0, hard_neg_gamma=2.0 (standard focal-loss default exponent).
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v13.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 7.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

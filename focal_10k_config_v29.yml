@@ -1,0 +1,79 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v29.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 0.0 \
+#     --bg_base_weight 1.5 --focal_head_dim 64 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v22 = accepted baseline before the focal-head architecture (see focal_10k_config_v22.yml).
+# v23-v27 = 5 loss-side "more absence pressure" mechanisms, all regressed vs v22 (see those
+# configs). v28 = dedicated focal head (make_geo_model_net_focal_head/FocalScatterAdd in
+# lib/models/geo_model_net.py) - a structural change instead of another loss term, giving focal
+# taxa a small separate 2-layer head (64 hidden units) reading raw input directly, on top of the
+# shared backbone. RESULT was the best of the whole series on both metrics (avg specificity
+# ~0.984 vs v22's ~0.920, sensitivity near-perfect including Ant), though a gap-generalization
+# diagnostic left open whether it's learning a real climate boundary or fitting sharply around
+# known points (see focal_10k_config_v28.yml). v28's checkpoints were
+# accidentally deleted by a cleanup command after training completed (recipe and all analysis
+# preserved; only the trained weights were lost) - this run's exact command is a faithful
+# reproduction of what v28 ran, MINUS one variable (below), since the checkpoint needs
+# retraining regardless.
+#
+# Also: v23-27's hard_neg_scale and covariate_penalty_scale mechanisms were removed from
+# sinr_loss.py/train_tf_sinr_test.py entirely (not just left disabled) after all 6 runs using
+# them regressed - dead code from proven-negative results. Neither was ever active in v28's
+# actual training run (both defaulted to 0/unused there), so this removal doesn't change v28's
+# reproduction at all - same code path, not just "should behave similarly."
+#
+# v29 vs v28: ONE additional change on top of reproducing v28 - range_penalty_scale 3.0->0.0.
+# Rationale: range_penalty_scale is a per-focal-species-only mechanism (KDTree distance penalty
+# from each focal species' own observations), and now that focal taxa have dedicated capacity
+# via focal_head_dim, it's plausible the head already learns what range_penalty was added to
+# enforce - making range_penalty now redundant machinery for exactly the classes it targets.
+# (bg_base_weight/effort_scale stay unchanged - those apply to ALL ~10,000 classes, not just
+# the 7 focal ones, so they're not what focal_head_dim could make redundant.) This combines two
+# questions into one run: does the focal-head recipe reproduce, and is range_penalty now
+# unnecessary. If v29 matches v28's known numbers, both questions are answered together and
+# range_penalty_scale + its KDTree machinery can be deleted as further unnecessary complexity.
+# If v29 clearly underperforms v28's known numbers, range_penalty_scale is still doing real work
+# for focal species even with a dedicated head, and the fallback is a straight v28 reproduction
+# (range_penalty_scale=3.0 restored, everything else identical) to get a checkpoint back.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v29.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

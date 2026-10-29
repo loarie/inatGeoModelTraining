@@ -1,0 +1,54 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v4.yml \
+#     --train_npy train_10k_focal --bg_sampling target_group \
+#     --bg_tg_fraction 0.5 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 1.5 --focal_oversample 5 --no_wandb
+#
+# v4 vs v3: v3 fixed the loss-bouncing problem (hidden_dim 256->512, lr_decay 0.98->0.93).
+# v4 additionally fixes an ocean false-positive bug: lib/models/encoders.py:115 replaces NaN
+# raster values (bio1-19 have no data over open ocean - WorldClim is land-only) with 0.0, and
+# since these channels are z-scored, 0.0 == the mean, so ocean pixels silently looked like
+# "perfectly average land climate" instead of clearly out-of-distribution. Confirmed via direct
+# model queries: predictions decayed very slowly moving offshore (0.996 at the coast -> 0.54 at
+# 550km out) because only coast_distance carried any real signal out there. Added an explicit
+# land_mask channel (1=land, 0=ocean, derived from the bio1 NaN footprint) so the model has a
+# clean, sharp signal instead of relying on 19 fake-neutral covariates + coast_distance alone.
+# New raster: bioclim_coast_effort_landmask_scaled.npy (23ch: elev, bio1-19, coast_dist,
+# land_mask, effort).
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v4.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 4.0
+
+sinr_hyperparams:
+    pos_weight: 1.5

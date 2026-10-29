@@ -1,0 +1,75 @@
+# v41: exactly the v40 recipe (IndependentPerClassHead + logits-based sinr_loss +
+# --pos_weight_adapt + v39's correctly-scoped grad clipping - see focal_10k_config_v40.yml for
+# the full rationale on each), but trained on captive/cultivated-filtered data instead of v40's
+# raw train_5007. v40 was killed at epoch023/30 (2026-09-19) after a computer restart forced a
+# resume from epoch015 that lost the Adam optimizer's momentum/variance state (only the model
+# weights and the adaptive pos_weight vector survive a checkpoint - the optimizer itself is
+# freshly constructed every run) - loss and stuck-class count both got visibly worse right at
+# that resume boundary, so v41 is a clean from-scratch run rather than a v40 resume.
+#
+# Data: train_5007_clean_matched_{locs,class_ids,unique_taxa}.npy - same underlying observations
+# as train_5007 but with captive/cultivated-flagged records dropped (12,607,962 -> 11,792,525
+# obs, -6.5%). One taxon (418115) lost every one of its records and was dropped entirely
+# (5,007 -> 5,006 species). All 7 classic named focal taxa survive.
+#
+# focal_taxa: 500 species in group500_taxa_v41.npy, built by reapplying the v33 group500
+# methodology (stratify by log10(observation count) into 10 equal-width bins, ~49/bin,
+# seed=42, union with the 7 known focal taxa) to the clean_matched dataset's own count
+# distribution instead of reusing v33-v40's original group500_taxa.npy taxon_id list - the
+# per-species counts shifted under cleaning, so the original 493 stratified taxon_ids are no
+# longer the right stratified sample of the new distribution. Pool restricted to species with
+# >=100 obs (clean_matched's tail goes as low as 2 obs after filtering, whereas train_5007 had
+# a uniform 100-obs floor baked in at prior preprocessing) so the bin range is comparable to
+# v33-v40's group500 (100 to ~100,000 obs). Final group: min=100 max=98,463 median=2,690 obs
+# (v33-v40's group500: min=100 max=100,000 median=2,539 - closely comparable). This is a fresh
+# implementation of the documented v33 recipe, not a byte-identical reproduction of the
+# original (uncommitted, one-off) selection script - see select_stratified_group.py.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v41.yml \
+#     --train_npy train_5007_clean_matched --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 30 \
+#     --focal_taxa <500 taxon_ids - see group500_taxa_v41.npy, comma-join via
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('group500_taxa_v41.npy')))"` > \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --no_wandb \
+#     --pos_weight_adapt --pos_weight_adapt_every 3 --pos_weight_adapt_threshold 0.05 \
+#     --pos_weight_adapt_factor 2.0 --pos_weight_adapt_max 50.0
+#
+# EVALUATE: same protocol as v33-v40 - full 500-group stuck/partial/converged breakdown at every
+# adaptation check. v40's specific watch taxa (9296, 133607) are NOT in group500_taxa_v41.npy's
+# stratified sample by construction (different random draw against a different distribution) -
+# use check_population.py's own worst-performers ranking on this run instead of assuming those
+# two are still the sharpest test.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 30
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v41.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

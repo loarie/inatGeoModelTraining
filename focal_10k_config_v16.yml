@@ -1,0 +1,65 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v16.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 --no_wandb
+#
+# (v11 = accepted baseline: pos_weight=2.25, effort_scale=7.0, range_penalty_scale=3.0/cap=5.0,
+# clipnorm=1.0, bg_tg_fraction=0.65 - copied to baseline_v11_accepted.keras. v12-v15 tried
+# various additional levers (bg_base_weight, hard-negative mining, pushed pos_weight/
+# effort_scale further) on top of v11, none beat it; v15 in particular ended up clearly worse
+# across every species (Millipede 0.653, Ant 0.321 vs v11's 0.999/0.725) despite the effort
+# column bug fix.)
+#
+# CONTEXT: v11 (like every run v6-v14) was trained with a real bug - effort_vals was read via
+# fake_x[:, -1], which stopped being the true effort column once v6 appended 19 interaction
+# channels after it (effort is channel 22 of 42, not last). Fixed in train_tf_sinr_test.py via
+# EFFORT_COL = coord_feat_dim + 22. This means v11's own result is NOT a validated outcome for
+# "correct effort weighting at these hyperparameters" - it was achieved with corrupted effort
+# weighting throughout. v15 (bugfix + pushed pos_weight/effort_scale/hard-neg all at once)
+# performed clearly worse than v11, but that doesn't isolate whether the bugfix itself helped,
+# hurt, or was neutral, since multiple things changed simultaneously.
+#
+# v16 vs v11: pure isolation test. IDENTICAL hyperparameters to v11 (pos_weight=2.25,
+# effort_scale=7.0, range_penalty_scale=3.0/cap=5.0, clipnorm=1.0, bg_tg_fraction=0.65), no
+# hard_neg_scale, no bg_base_weight change - the ONLY difference from the original v11 run is
+# the effort column bug fix. Purpose: find out what the bugfix alone does, holding everything
+# else constant, before combining it with any further hyperparameter changes. No assumption
+# that this reproduces or beats v11 - genuinely unknown until run.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v16.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 7.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

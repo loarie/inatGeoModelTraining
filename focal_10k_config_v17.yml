@@ -1,0 +1,60 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v17.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 --no_wandb
+#
+# (v11 = accepted baseline, trained with the effort-column bug: pos_weight=2.25,
+# effort_scale=7.0. v16 = same hyperparameters with the bug fixed - performed WORSE than v11
+# across every species (Lewisia 0.745 vs 0.999, Ant 0.205 vs 0.725), because true effort in
+# realistic mixed training batches (65% real-observation locations + 35% random, per
+# bg_tg_fraction) turns out to be much DENSER and higher-valued than assumed - mean 0.42,
+# median 0.52, 68% of points >0.02 - versus the old buggy proxy channel (coast_dist*bio19
+# interaction), which hovered near zero on average (mean magnitude ~0.05-0.1). At the same
+# nominal effort_scale=7, true effort was producing ~3.5 average extra background weight vs the
+# buggy channel's ~0.3-0.7 - a much stronger, more pervasive suppression than v11 was ever
+# actually tuned against, explaining the across-the-board regression.
+#
+# v17 vs v16: recalibrated effort_scale DOWN, not up - 7.0 -> 1.0, to land in a similar typical
+# extra-weight ballpark (~0.4-0.5) as what v11 was actually tuned against, now using true
+# effort. Notably, this returns close to v4's original effort_scale=4.0, which was set before
+# the v6 interaction channels broke effort extraction - i.e. this is a return toward the last
+# value that was ever tuned against genuinely correct effort, adjusted for the current batch
+# composition (bg_tg_fraction=0.65). pos_weight/range_penalty_scale/clipnorm unchanged from v11.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v17.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 1.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

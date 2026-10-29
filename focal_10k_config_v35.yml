@@ -1,0 +1,83 @@
+# v35 vs v33/v34 (see focal_10k_config_v34.yml for full detail): tests the redesigned
+# architecture agreed on after v34 confirmed zero-init was NOT the (sole) root cause of the
+# dead-class collapse - the problem is the SHARING itself (all N focal classes reading out
+# through one common hidden bottleneck), not how that shared layer is initialized. As a
+# deliberate choice, the next step is NOT taxonomy- or geography-based species grouping
+# (no coherent, non-arbitrary way to define groups across ~120k species) but a genuinely
+# different architecture.
+#
+# NEW: --independent_head_dim (replaces --focal_head_dim) - gives EVERY focal class its own
+# fully INDEPENDENT small 2-layer MLP (IndependentPerClassHead in lib/models/geo_model_net.py,
+# vectorized via tf.einsum batched matmul), with ZERO weight-sharing between classes at all -
+# not just a smaller shared bottleneck. There is nothing for classes to compete over and no
+# shared degenerate start to race from, regardless of N or hidden width. First layer: random
+# (he_normal-equivalent) init per class. Output layer: zero-init per class (same deliberate
+# no-op-at-epoch-0 start as v28's proven recipe), but since every class's W2 is independent,
+# zero-init here carries none of the symmetric-race risk it did in the shared head - each class
+# breaks its OWN symmetry using its OWN untouched hidden units, never touching any other class's.
+# Verified empirically before this run: perturbing a loss on class i's output alone produces
+# nonzero gradient ONLY on class i's W1/b1/W2/b2, confirming true zero cross-class coupling.
+#
+# EVERYTHING else identical to v33/v34 - same train_5007 dataset, same 500-species group
+# (group500_taxa.npy, includes all 7 known focal species), same per-species oversampling, same
+# restored v22/v28 hyperparameters, same safety nets:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v35.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <500 taxon_ids - see
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('group500_taxa.npy')))"` > \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --stability_check --no_wandb
+#
+# independent_head_dim=16 (vs v33/v34's shared focal_head_dim=128): each class's independent
+# head is deliberately small (~1,100 params/class at dim=16, ~550K total for 500 classes) since
+# there's no crowding-ratio risk to manage by making it big - it just needs enough hidden units
+# per class to represent one species' covariate signal, matching v28's per-species capacity
+# more closely than v33/v34's shared 128-wide bottleneck ever could.
+#
+# EVALUATE: same protocol as v33/v34 - visualize_combined.py/check_specificity.py on the 7 known
+# species AND a random sample of the other ~493 group members (checking mean_pred at their own
+# real observation points for dead-class collapse), not just the 7 - that broader check is what
+# actually caught v33's failure after the 7 known species looked deceptively fine for 3 epochs.
+#
+# If this fixes the collapse: strong evidence the shared-bottleneck mechanism (not the head
+# concept itself) was the failure mode all along - worth then testing at v30's larger N=5,007
+# scale, and eventually toward the full ~120k-species goal (parameter count scales linearly in N
+# at fixed per-class hidden_dim, so this should remain tractable well past 500).
+# If dead classes STILL persist even with zero cross-class weight sharing: the failure mode is
+# something more fundamental than architecture (e.g. loss/optimizer dynamics operating per-class
+# regardless of parameter sharing), and the next investigation needs to look there instead.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v35.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

@@ -1,0 +1,61 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v12.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.5 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --bg_base_weight 1.15 --no_wandb
+#
+# (v1-v9: see focal_10k_config_v8.yml/v10.yml. v10 = accepted baseline: clipnorm=1.0 +
+# range_penalty_scale=3.0/cap=5.0. v11 = pos_weight 2.0->2.25, effort_scale 6.0->7.0, both small
+# nudges on top of v10, clean results for 6/7 species + Ant held at 0.725, no regressions.)
+#
+# v12 vs v11: feedback on v11 - the pos_weight bump (lever 1: pull harder toward 1 at real
+# presence points) was a clear win. The effort_scale bump (lever 2: pull harder toward 0 where
+# other species have effort but this one doesn't) was mixed - more false positives specifically
+# in LOW-sampling areas, where effort_scale has ~nothing to amplify (effort~0 there regardless
+# of the multiplier). Identified a THIRD lever, previously hardcoded and not exposed: sinr_loss.py
+# applied a flat "1.0 +" baseline to loss_bg's effort_bg_matrix multiplier - i.e. background
+# absence pressure had an unconditional floor of exactly 1.0x, independent of both effort_scale
+# and range_penalty. Exposed this as bg_base_weight (new CLI flag + sinr_loss.py param, default
+# 1.0 = unchanged behavior) - this is the lever for "lower intensity where there's no presence,
+# regardless of sampling," decoupled from effort_scale. Two changes this version, both cautious:
+#   - pos_weight 2.25->2.5 (push the lever that already worked a bit further)
+#   - bg_base_weight 1.0->1.15 (new lever, first use, deliberately conservative)
+# effort_scale and range_penalty_scale/cap left unchanged from v11/v10.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v12.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 7.0
+
+sinr_hyperparams:
+    pos_weight: 2.5

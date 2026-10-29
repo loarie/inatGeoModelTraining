@@ -1,0 +1,70 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v19.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --hard_neg_scale 2.0 --hard_neg_gamma 2.0 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py
+# (specificity/false-positive rate at 3000+-obs true-absence cells). Sensitivity alone is
+# misleading - see v17.
+#
+# v11 (bug-era effort_scale=7.0) is NO LONGER the target to beat - it optimized against a real
+# bug (effort_vals read the wrong raster channel, see focal_10k_config_v16.yml) and is
+# considered a weak foundation even though its numbers were good. v18 (bugfix,
+# effort_scale=3.0, no hard-negative mining) is the new base to build forward from:
+# specificity Pika 1.000, Millipede 0.963, Lily 0.831, Crab 0.923, Lewisia 0.860, Amorph 0.799,
+# Ant 0.678 - matches v11 on 2/7 species, below it on the other 5, still too many false
+# positives visually on review.
+#
+# v19 vs v18: two complementary changes to push specificity further -
+#   - effort_scale 3.0->5.0: continue the calibration search (1.0 was too weak, 3.0 better but
+#     still short of v11 on 5/7 species - climbing further rather than assuming 3.0 was the
+#     ceiling).
+#   - hard_neg_scale 0->2.0 (gamma=2.0): re-enable hard-negative mining, NOW combined with
+#     correct effort weighting for the first time (v13 predates the effort-column bugfix, so it
+#     was never tested against trustworthy effort_bg_matrix). This adaptively boosts the loss
+#     wherever the model is CURRENTLY overconfident, on top of (not instead of) the effort-based
+#     floor - complementary to raising effort_scale, not redundant with it.
+# pos_weight/range_penalty_scale/clipnorm unchanged from v18/v11.
+#
+# NOTE: check_specificity.py's 3000+-obs true-absence cells are used ONLY as an evaluation
+# set, never fed into training as an explicit hard-negative set - keeping it an independent
+# check, not something optimized against directly.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v19.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

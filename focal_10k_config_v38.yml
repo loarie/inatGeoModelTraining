@@ -1,0 +1,76 @@
+# v38: replaces v37's one-time flat pos_weight boost with a closed-loop adaptive controller.
+#
+# v37 (flat 8x boost on the 161 classes stuck at v36 epoch9, manually identified) confirmed the
+# mechanism is real - 97% of 161 boosted classes moved in the predicted direction over 5 epochs,
+# not noise - but a single flat multiplier chosen once wasn't sufficient for most of them: only
+# 43/161 (27%) crossed into solidly-positive territory (mean>0.05) by epoch14, and some (e.g.
+# taxon 9296) showed essentially zero response even after 5 epochs at 8x. That flat, one-shot,
+# manually-curated design also can't generalize to the real ~120k-species target - nobody will
+# hand-pick a stuck-list at that scale.
+#
+# NEW: --pos_weight_adapt (train_tf_sinr_test.py) turns pos_weight-boosting into an automatic,
+# in-loop, closed-loop controller. Every --pos_weight_adapt_every epochs, it re-evaluates every
+# class in --pos_weight_adapt_taxa (defaults to the full focal group - no manual curation needed)
+# against --pos_weight_adapt_threshold, and multiplies pos_weight by --pos_weight_adapt_factor for
+# any class still below it, capped at --pos_weight_adapt_max x the base pos_weight. A class that
+# crosses threshold stops being boosted further; a class that keeps failing keeps compounding
+# rather than being left at v37's single fixed multiplier forever. See adapt_pos_weight() in
+# train_tf_sinr_test.py.
+#
+# Resumed from v37's epoch14 checkpoint (focal_10k_model_v38.epoch014.keras, copied from
+# focal_10k_model_v37.epoch014.keras) rather than restarting from v36's epoch9 - v37's manual 8x
+# boost already produced real, measurable gains for a meaningful minority (e.g. 42122: 0.01->0.27,
+# 70230: 0.07->0.21) and there's no reason to throw that away. The SAME 161-class 8x boost is
+# re-applied as v38's starting pos_weight state (via --pos_weight_boost_taxa/--pos_weight_boost_factor,
+# unchanged from v37) so nothing regresses on relaunch, then --pos_weight_adapt takes over from
+# there for the remaining epochs, watching the full 500-species group (not just the original 161)
+# so any newly-lagging class gets caught too.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v38.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <same 500 taxon_ids as v33-v37> \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --stability_check --no_wandb \
+#     --pos_weight_boost_taxa <same 161 taxa as v37> --pos_weight_boost_factor 8.0 \
+#     --pos_weight_adapt --pos_weight_adapt_every 3 --pos_weight_adapt_threshold 0.05 \
+#     --pos_weight_adapt_factor 2.0 --pos_weight_adapt_max 50.0 \
+#     --start_epoch 14
+#
+# EVALUATE: same protocol as v33-v37 - track the full stuck-161 population (not just a few
+# anecdotes - v37's six hand-tracked classes looked more encouraging than the true population
+# stats turned out to be), plus specifically watch whether persistent non-responders like taxon
+# 9296 (zero movement through all of v37) finally react once its weight compounds past 8x.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v38.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

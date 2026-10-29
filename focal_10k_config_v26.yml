@@ -1,0 +1,107 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v26.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --bg_base_weight 1.5 --covariate_penalty_scale 3.0 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v22 = ACCEPTED BASELINE (bugfix + effort_scale=5.0 + bg_base_weight=1.5, no hard-negative
+# mining), copied to baseline_v22_accepted.keras. Specificity: Pika 0.990, Millipede 0.919,
+# Lily 0.964, Crab 0.939, Lewisia 0.942, Amorph 0.943, Ant 0.743 (avg ~0.920).
+#
+# v23 (bg_base_weight 1.5->2.0) and v24 (range_penalty_scale 3.0->4.0) and v25 (hard_neg_scale
+# 0.0->1.0) were all clear regressions vs v22 - three different "add more absence pressure"
+# mechanisms in a row, all net negative. See those configs' comments for details. Not pursuing
+# any of them further; checkpoints deleted, v22 remains the accepted baseline.
+#
+# v26 vs v22: a fundamentally different KIND of mechanism, not another absence-pressure dial.
+# Root cause investigation: v22's
+# Millipede false positives aren't scattered noise - they track the ENTIRE Rocky Mountain range
+# by elevation (checked via a N->S transect: CO 0.838, ID/WY 0.965, MT 0.594, BC interior
+# 0.92-1.00, vs WA true coast 0.996). At the Colorado point, geographic range_penalty is already
+# near its practical max (4.53 extra weight at scale=3.0, ~1670km from nearest real millipede
+# obs) and STILL predicts 0.838 - so this isn't a "not enough geographic penalty" problem, it's
+# a genuine CLIMATE-ANALOG problem that geographic distance can't reach: high-elevation Rockies
+# cells are climatically closer to coastal PNW (similar bio1/temp) than their geographic
+# distance would suggest.
+#
+# Diagnosis: bio4 (temperature seasonality, already in the existing 19 bioclim channels - no new
+# data needed) cleanly separates the two: millipede's own observations sit at bio4 in
+# [-1.25,-0.63] (5th-95th pctile, very low seasonality = oceanic), while a grid of 3,808
+# high-elevation cells across the Rockies corridor sits at [-0.30,+0.67] (moderate-to-high
+# seasonality = continental) - literally 0% overlap across the two distributions. The raster
+# already has the signal; the model (sharing one 512-dim hidden layer across 10,007 classes,
+# with only 13,206 millipede presence points) just isn't learning to use it for this species.
+#
+# New mechanism: --covariate_penalty_scale, the covariate-space analogue of range_penalty_scale
+# (train_tf_sinr_test.py: BIO4_COL/focal_bio4_bounds/covariate_penalty_matrix, new code alongside
+# the existing KDTree range penalty, sinr_loss.py unchanged). For each focal taxon, compute the
+# [1st,99th] percentile bio4 range from that species' own real observations; at every training
+# step, background points get extra absence penalty scaled by how far outside that range their
+# own bio4 falls (z-score units, capped at 5.0, same style as RANGE_PENALTY_CAP) - independent of
+# geographic distance or effort. This directly targets "climatically implausible for THIS
+# species" rather than "geographically far from THIS species," which is the gap range_penalty
+# left open. Kept range_penalty_scale=3.0/bg_base_weight=1.5/effort_scale=5.0 unchanged from v22
+# so this composes with the existing mechanism rather than replacing it. Chose
+# covariate_penalty_scale=3.0 to match range_penalty_scale's value for a first, comparable test.
+#
+# v26 RESULT: a clear regression, and a more informative one than v23-25 - it made the TARGET
+# problem WORSE, not better (Millipede CO Rockies transect point: 0.838->0.960; ID/WY
+# 0.965->1.000; MT 0.594->0.993), avg specificity dropped ~0.920->~0.858 (every species worse,
+# including Millipede itself: 0.919->0.863), AND a pre-v22 Eurasia climate-analog artifact (see
+# v6-v8 history) came back for species that had none in v22 (E Mediterranean: Lily 0.985, Crab
+# 0.603, Lewisia 0.664, Amorph 0.864). Root cause hypothesis: range_penalty_matrix and
+# covariate_penalty_matrix were SUMMED, so a background point both geographically far and
+# climate-mismatched could hit ~36x combined weight - spikier than clipnorm=1.0 can rescale
+# without dampening other gradient signal that step (same class of problem v8->v9 fixed once for
+# range_penalty alone). Tested by combining via max() instead in v27 (see focal_10k_config_v27.yml)
+# - that did NOT rescue the mechanism (still regressed, target problem still not fixed), so the
+# covariate-penalty mechanism itself, not just its combination with range_penalty, appears to be
+# the problem. Not pursuing covariate_penalty_scale further; v26 checkpoints deleted.
+#
+# After v23/v24/v25/v26/v27 (5 different loss-side "more absence pressure" mechanisms, 6 runs
+# total including v27's recombination) all regressed vs v22, decided to stop this line of
+# investigation. v22 remains the accepted baseline. Next direction: dedicated per-species
+# capacity (e.g. a small focal-species-specific embedding/head) instead of more loss engineering,
+# since the diagnosis (real bio4 signal exists with 0% distributional overlap, model just isn't
+# learning to use it for Millipede specifically) points at a capacity/attention problem sharing
+# one 512-dim hidden layer across 10,007 classes, not a loss-weighting problem.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v26.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

@@ -1,0 +1,79 @@
+# v37: not a new architecture/loss experiment - a targeted empirical probe on top of v36's
+# already-validated fixes (IndependentPerClassHead + logits-based sinr_loss, both confirmed
+# working - see focal_10k_config_v35.yml and sinr_loss.py's docstring).
+#
+# v36 (same 500-species group as v33-v36, group500_taxa.npy) ran 9 epochs and showed: the
+# architecture/loss fixes eliminated both prior collapse mechanisms (no shared-bottleneck race,
+# no vanishing-gradient runaway), but 161/500 classes (32%) plateaued at a stable NEGATIVE logit
+# for 6+ consecutive epochs (epochs 4-9) with essentially zero net drift - oscillating within a
+# fixed band, not climbing. This isn't v35's mechanism (nothing frozen, gradients measurably
+# non-vanishing at this logit range) - it looks like a genuine loss EQUILIBRIUM where, for these
+# classes' specific geography/data, the current hyperparameters (pos_weight=2.25 flat,
+# bg_base_weight=1.5, effort_scale=5.0, range_penalty_scale=3.0) don't provide enough net
+# positive pull to cross zero.
+#
+# Four candidate explanations were tested directly against data and REJECTED: geographic
+# diffuseness (the stuck classes are just as tightly-ranged as ones that converged), oversample
+# factor (both stuck and converged classes include factor=1 members), raw observation count (no
+# correlation - some high-count classes are stuck, some low-count classes converged fastest), and
+# local background-traffic density (computed ratio of total nearby observations / own count -
+# overlapping ranges between stuck and converged groups, not separable).
+#
+# Rather than continue guessing from static features, this run tests the mechanism directly:
+# NEW --pos_weight_boost_taxa / --pos_weight_boost_factor (train_tf_sinr_test.py) multiplies
+# pos_weight for a named list of classes on top of the base value, leaving all other classes at
+# their normal pos_weight=2.25. The 161 stuck classes (mean_pred < 0.05 at v36 epoch9,
+# v36_epoch9_stuck_taxa.npy) get an 8x boost (pos_weight=18.0); everyone else is unchanged from
+# v36's exact recipe. If they escape their plateau: confirms a real positive/background balance
+# issue (not architecture, not loss numerics) and gives a validated intervention design for scale.
+# If an 8x boost still doesn't move them: rules out weighting entirely, points to something else
+# (e.g. genuinely weak covariate separability for these specific species).
+#
+# Resumed from v36's epoch9 checkpoint (focal_10k_model_v37.epoch009.keras, copied from
+# focal_10k_model_v36.epoch009.keras) rather than from scratch, since the goal is to see whether
+# an ALREADY-STABLE equilibrium can be broken by more positive pressure, not to re-litigate
+# early-training dynamics. v36 itself was stopped at epoch9 (6 epochs of flat evidence was
+# enough) to free the machine for this test.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v37.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <same 500 taxon_ids as v33-v36> \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --stability_check --no_wandb \
+#     --pos_weight_boost_taxa <161 stuck taxon_ids, see v36_epoch9_stuck_taxa.npy> \
+#     --pos_weight_boost_factor 8.0 \
+#     --start_epoch 9
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v37.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

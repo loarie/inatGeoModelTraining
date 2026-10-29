@@ -1,0 +1,93 @@
+# NEW EXPERIMENT LINE: tests whether the focal-head mechanism (v28, see focal_10k_config_v28.yml
+# for its full history) survives losing its exclusivity. v22-v29 all trained on
+# train_10k_focal_clean, where 7 hand-picked species got a dedicated head/oversampling/
+# exemptions while ~10,000 others were capped at 500 obs each. That curation approach cannot
+# scale to the real target (~120k species, no natural "special 7"), so this run tests the
+# scaling hypothesis directly: apply the SAME dedicated-head mechanism to EVERY species in the
+# dataset, no curation, and see if it still helps.
+#
+# Dataset: train_5007 (NOT train_10k_focal_clean) - 5,000 randomly-sampled species (each with
+# its full, real, uncapped observation count, no artificial cap) via
+# extract_random_species_dataset.py, run on the remote server against the full ~500M-point/
+# 120k-species pool, PLUS the same 7 known focal species stitched on via
+# stitch_focal_species.py (the remote extraction's --force_include didn't take effect the first
+# time, so these were pulled from train_10k_focal_clean's true counts instead of re-running the
+# ~2.5hr remote extraction). This makes
+# the 7 known species directly comparable against their v22/v28/v29 results, embedded fairly in
+# a dataset where nobody gets a data-volume advantage - unlike train_10k_focal_clean, every
+# species here (5,007 of them) has its true, real count: 100 to 100,000 obs, mean ~2,518.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v30.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <all 5007 taxon_ids - see /tmp/all_5007_taxa.txt or regenerate via
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('train_5007_unique_taxa.npy')))"` > \
+#     --pos_weight 2.25 --focal_head_dim 256 --bg_base_weight 1.5 --no_wandb
+#
+# Deliberately NOT passing --focal_oversample or --range_penalty_scale: those are
+# per-named-species mechanisms (oversample specific taxa, KDTree penalty per named taxon) that
+# don't make sense applied uniformly to 5,007 species with no curation - the whole point here is
+# a mechanism that requires no manual per-species setup. --focal_head_dim raised 64->256 since
+# the shared secondary path now needs to represent structure useful across 5,007 classes, not 7.
+#
+# EVALUATE: visualize_combined.py/check_specificity.py on the 7 known species (direct comparison
+# to v22 ~0.920 avg specificity, v28 ~0.984, v29 ~0.972), AND spot-check some of the other 5,000
+# species across the sample-size spectrum (100 obs vs 50,000+ obs) to see whether the mechanism
+# helps broadly or only helped because it was exclusive to 7 species in v28.
+#
+# v30 RESULT: DIVERGED. Epochs 1-4 looked promising (well-sampled focal species already at
+# 0.98-0.99 mean by epoch 1-3, faster than any prior version) but epoch mean loss started
+# climbing at epoch 5 (2.10->2.49->2.46->3.07 through epoch 7) and kept getting worse, not
+# oscillating-then-settling. By epoch 7, Pika and Millipede had collapsed to ~1e-17/1e-13
+# output EVERYWHERE (a dead-output collapse, not weak calibration - the 95% sensitivity
+# threshold itself degenerated to ~0 since presence-point scores collapsed too, so the entire
+# globe technically cleared it). A random sample of 100 of the other 5,000 classes showed 85
+# had collapsed the same way - a systemic, not narrowly-targeted, failure. Killed at epoch 7.
+#
+# Root cause hypothesis: this dataset has a ~1000x observation-count range (100 to 100,000 per
+# species, median 453) that this codebase has never trained on before - always either curated
+# (7 focal + capped background) or now uniform-but-narrow. A single flat pos_weight=2.25
+# applied identically to every class regardless of count means a 100,000-obs class contributes
+# ~1000x the aggregate positive-loss gradient of a 100-obs class per epoch, with no oversampling
+# to counterbalance it (deliberately omitted here since it's a per-named-species mechanism).
+# clipnorm=1.0 bounds the total gradient norm but can't stop one output column in a 5,007-wide
+# shared layer from absorbing a disproportionate, badly-directed share of that budget.
+#
+# Fix attempted in v31 (focal_10k_config_v31.yml): --pos_weight_balance_exponent 0.5 (scales
+# pos_weight down for high-count classes, sqrt(median/count) capped at 1.0 so classes at/below
+# the median are unaffected), --grad_clip_value 1.0 (per-element clip before the optimizer's
+# global-norm clip), initial_lr 0.0005->0.0001, and --stability_check (auto-stop if epoch loss
+# rises >5% for 2 consecutive epochs, so a future divergence is caught immediately rather than
+# discovered hours later).
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v30.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

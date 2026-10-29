@@ -1,0 +1,77 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v24.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 4.0 \
+#     --bg_base_weight 1.5 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v22 = ACCEPTED BASELINE (bugfix + effort_scale=5.0 + bg_base_weight=1.5, no hard-negative
+# mining), copied to baseline_v22_accepted.keras. Specificity: Pika 0.990, Millipede 0.919,
+# Lily 0.964, Crab 0.939, Lewisia 0.942, Amorph 0.943, Ant 0.743 (avg ~0.920).
+#
+# v23 (bg_base_weight 1.5->2.0, everything else unchanged) was a clear REGRESSION, not a
+# further win - specificity dropped across nearly every species (avg ~0.887) AND the
+# visualize_combined sensitivity threshold collapsed toward 0 for several species (near-total
+# false-positive world maps). Conclusion: bg_base_weight is a blanket, uniform-pressure knob -
+# past its sweet spot (1.5) it compresses presence and absence scores together rather than
+# sharpening the boundary between them, degrading discrimination in both directions at once.
+# Not pursuing bg_base_weight further; v23 checkpoints deleted, not kept.
+#
+# v24 vs v22: different, more targeted lever - range_penalty_scale 3.0->4.0 (bg_base_weight
+# back to v22's 1.5, effort_scale unchanged at 5.0). Unlike bg_base_weight, this is
+# distance-conditioned: it only adds extra absence pressure scaled by how far a background
+# point is from that species' own known observations (per-species KDTree, see
+# train_tf_sinr_test.py), capped at RANGE_PENALTY_CAP=5.0. Hypothesis: this should suppress
+# far-away false positives without crushing signal near real range boundaries the way the flat
+# bg_base_weight did. Chose 4.0 (not 5.0, which would hit RANGE_PENALTY_CAP exactly with no
+# margin) as a cautious single-step increment, to be re-evaluated with both metrics before
+# going further - same ablation discipline that caught the v23 regression.
+#
+# v24 RESULT: also a clear REGRESSION, same failure mode as v23. Specificity dropped across
+# every species (avg ~0.818 vs v22's ~0.920): Pika 0.990->0.716, Millipede 0.919->0.845,
+# Lily 0.964->0.892, Crab 0.939->0.928, Lewisia 0.942->0.790, Amorph 0.943->0.912,
+# Ant 0.743->0.645. Sensitivity stayed fine (0.94-0.99 except Ant, unchanged), so this isn't
+# an undertrained/non-convergence issue. Conclusion: like bg_base_weight, range_penalty_scale
+# past its sweet spot (3.0) also compresses presence/absence scores together instead of
+# sharpening the boundary, contrary to the distance-conditioning hypothesis above. Not
+# pursuing range_penalty_scale further; v24 checkpoints deleted, not kept. v22 remains the
+# accepted baseline.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v24.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

@@ -1,0 +1,77 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v8.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.0 --focal_oversample 5 --range_penalty_scale 3.0 --no_wandb
+#
+# (v1-v6 history: see focal_10k_config_v6.yml comments for the full land_mask / data-cleaning /
+# coast-interaction-feature history that got Crab's Amazon-interior blob fixed.)
+#
+# v7 vs v6: v6 left two open problems: (1) Ant never converged (mean=0.761, p10=0.551 at epoch
+# 20 vs 0.968+ for every other focal species - only 180 presence points), and (2) general
+# range-edge miscalibration (e.g. Lily false absences at the southern/warm range edge, false
+# presences at the northern/cool edge - the omission/commission tradeoff of a thresholded
+# continuous surface). Tuned three existing hyperparameters: pos_weight 1.5->2.0 (push harder on
+# fitting true presence, reducing false absences), effort_scale 4.0->6.0 (more strongly penalize
+# predicted presence where other species have real observation effort but this species doesn't),
+# bg_tg_fraction 0.5->0.65 (lean more on real effort-weighted background vs uniform-random).
+# Result: Ant improved substantially (mean=0.867, p10=0.682) and Amorph ticked up too, BUT Pika
+# and Lewisia got measurably worse (Pika 1.000/1.000 -> 0.995/0.986, Lewisia 0.999/0.998 ->
+# 0.993/0.968) and the pre-existing Africa/Central-Asia climate-analog extrapolation artifact
+# (see v6 comments) spread to more species and grew stronger, especially on Pika. Root cause:
+# making the model more confident everywhere (higher pos_weight/effort_scale) sharpens BOTH real
+# ranges and spurious climate-analog matches - there was no mechanism distinguishing "confident
+# because real" from "confident because climate looks similar but is geographically implausible".
+#
+# v8 vs v7: added a genuinely new mechanism rather than more hyperparameter tuning - a
+# distance-based range penalty, the literal opposite of pos_weight. For each focal species, a
+# KDTree of that species' own real observations is built; at every training step, background
+# points get an EXTRA absence penalty scaled by distance (capped) from that species' OWN nearest
+# real observation - independent of environmental covariate similarity, independent of other
+# species' effort. This directly targets the Sahara/Central-Asia-style failure (climatically
+# plausible, geographically absurd) that effort_scale can't reach (effort there is genuinely
+# ~0 for every species, confirmed via raster lookup, so effort-based penalties have nothing to
+# amplify). Implemented as a pure loss-side change (lib: sinr_loss.py unchanged, new logic in
+# train_tf_sinr_test.py's per-step effort_bg_matrix construction + new --range_penalty_scale
+# CLI flag) - no architecture or input-feature change, so it composes with everything in v7
+# rather than replacing it. Kept pos_weight=2.0/effort_scale=6.0/bg_tg_fraction=0.65 from v7 to
+# preserve the Ant improvement, added range_penalty_scale=3.0 (internal normalization: distance
+# in degrees / 10, capped at 5x, so points >~1500km from the species' own range get up to 5x
+# extra absence weight on top of the existing 1.0 baseline).
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v8.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 6.0
+
+sinr_hyperparams:
+    pos_weight: 2.0

@@ -1,0 +1,71 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v15.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.5 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --hard_neg_scale 2.0 --hard_neg_gamma 2.0 --no_wandb
+#
+# v14 vs v13: pushed effort_scale 7.0->10.0 and pos_weight 2.25->2.5 on top of v13's
+# hard-negative mining, to target high-effort false positives specifically. ABORTED: epoch mean
+# loss went negative (1.57 -> -0.66 by epoch 7), traced to a real bug (see below), not just
+# instability - killed before completing.
+#
+# BUG FOUND AND FIXED (train_tf_sinr_test.py): effort_vals was read via `fake_x[:, -1]` -
+# "last encoded column" - which was correct for the original 23-channel raster where effort
+# genuinely was the last channel, but broke silently in v6 when 19 coast_dist*bio interaction
+# channels were appended AFTER effort (raster is now 42ch, effort at position 22, no longer
+# last). Since v6, effort_vals has actually been reading the last INTERACTION channel
+# (coast_dist*bio19, range ~[-0.6, 3.4]) instead of true effort (range [0,1]) - confirmed via
+# direct comparison. This corrupted effort_bg_matrix with occasionally-negative "effort" values
+# for every run v6 through v14, which explains v14's negative loss (effort_scale=10 amplifying
+# a value that can be negative, compounded by hard_neg_scale) and is a very plausible root
+# cause for why effort_scale increases (v7, v11, v14) gave "mixed"/underwhelming results on the
+# specific high-effort-false-positive case throughout this whole effort. Fixed by computing the
+# correct fixed column index (EFFORT_COL = coord_feat_dim + 22 = 36) instead of relying on -1.
+# NOTE: model input construction (x[:, :-1] / fake_x[:, :-1], dropping the actual last column -
+# the interaction channel, not effort) was left AS-IS since train and inference (visualize_
+# combined.py) do this consistently with each other - changing it would require retraining
+# every checkpoint from scratch for a minor (1-of-42-channel) gain, not worth it right now.
+#
+# v15 vs v14: identical hyperparameters to the aborted v14 (pos_weight=2.5, effort_scale=10.0,
+# hard_neg_scale=2.0/gamma=2.0, range_penalty_scale=3.0/cap=5.0, clipnorm=1.0), rerun with the
+# effort bug fixed. v14's epoch 1-7 results looked genuinely promising (Ant hit 0.817, best of
+# any version) before it was killed - goal is to at least match that now that effort_scale is
+# actually doing what it's supposed to.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v15.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 10.0
+
+sinr_hyperparams:
+    pos_weight: 2.5

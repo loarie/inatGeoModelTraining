@@ -1,0 +1,94 @@
+# v34 vs v33 (see focal_10k_config_v33.yml for full detail): tests the sharpened root-cause
+# hypothesis directly, isolating ONE variable. v33's post-mortem noted that v22's plain shared
+# backbone has an almost identical classes-per-hidden-unit ratio to v30's failed universal head
+# (10,007/512 vs 5,007/256, both ~19.6) yet doesn't fail - and its final layer uses normal random
+# init, not the focal head's deliberate zero-init. That's the one structural difference between
+# "works fine at large N" (the backbone) and "collapses at large N" (the head) that isn't just
+# raw crowding ratio. Zero-init means every one of N focal classes starts at an IDENTICAL point
+# and must break symmetry via gradient descent from there - a race that's easy with 7 classes
+# (v28) and increasingly failure-prone as N grows (v33's 500, v30's 5,007), independent of
+# whatever the crowding ratio itself is doing.
+#
+# EVERYTHING else identical to v33 - same train_5007 dataset, same 500-species group
+# (group500_taxa.npy), same focal_head_dim=128, same per-species oversampling, same restored
+# v22/v28 hyperparameters, same safety nets:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v34.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <500 taxon_ids - see
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('group500_taxa.npy')))"` > \
+#     --pos_weight 2.25 --focal_head_dim 128 --focal_head_random_init --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --stability_check --no_wandb
+#
+# ONE change: --focal_head_random_init (new flag, lib/models/geo_model_net.py:
+# make_geo_model_net_focal_head's zero_init_final_layer=False) - the focal head's final Dense
+# layer now uses he_normal init, matching every other layer in this network, instead of zeros.
+# Classes start already-differentiated instead of racing from a shared degenerate point.
+#
+# EVALUATE: same protocol as v33 - visualize_combined.py/check_specificity.py on the 7 known
+# species AND a random sample of the other ~493 group members (checking mean_pred at their own
+# real observation points for dead-class collapse), not just the 7 - that broader check is what
+# actually caught v33's failure after the 7 known species looked deceptively fine for 3 epochs.
+#
+# If this fixes the collapse: strong evidence the symmetric zero-init race was the dominant
+# mechanism, not raw crowding ratio - worth then testing at v30's larger N=5,007 scale too.
+# If dead classes persist even with random init: zero-init wasn't the (sole) cause - the next
+# step is NOT taxonomy/geography-based grouping (no coherent, non-arbitrary way to define groups
+# across ~120k species - geography has disjunct-range/boundary problems, taxonomy doesn't track
+# environmental niche) but a genuinely different architecture: per-species embeddings scored
+#
+# v34 RESULT: FAILED, confirmed and conclusive. Killed at epoch 2 rather than letting it run to
+# completion, since the pattern was already stable and unambiguous. Random init did NOT prevent
+# dead-class collapse - it just changed the timing/mechanism: dead classes appeared IMMEDIATELY
+# (16/60 sampled other-group members already completely dead at epoch 1, vs v33 taking until
+# epoch 5 to reach ~31/60), and the SAME specific taxa (53183, 99539, 52591, 203409, 122056,
+# 116735, 224488, 448130, 67351, etc.) were dead at both epoch 1 and epoch 2, unchanged -
+# permanently stuck, not a transient dip. Likely explanation: random init trades the "symmetric
+# race" failure mode for a different one - it immediately injects noisy, uncorrelated per-class
+# signal into every class's output from step 0 (no more safe no-op start), and for however many
+# classes that noise happens to push toward increasingly negative output, the same sigmoid-
+# saturation/vanishing-gradient trap catches them just as fast, maybe faster.
+#
+# CONCLUSION: zero-init was not the (sole) root cause of the shared-bottleneck collapse - the
+# problem is the sharing itself, not how it's initialized. Any design where multiple classes
+# read out through a COMMON hidden representation, in that dedicated head, is at risk regardless
+# of init scheme. Per the plan agreed at this point: do NOT pursue taxonomy/geography-based
+# grouping (no coherent non-arbitrary way to define groups across ~120k species). Move to a
+# genuinely different architecture: give EVERY class in the group its own fully INDEPENDENT
+# small 2-layer network (zero weight-sharing between classes at all, not just a smaller shared
+# bottleneck) - see lib/models/geo_model_net.py:IndependentPerClassHead and
+# focal_10k_config_v35.yml, tested on this exact same 500-species group for a direct comparison.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v34.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

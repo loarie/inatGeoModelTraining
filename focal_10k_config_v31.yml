@@ -1,0 +1,90 @@
+# v31 vs v30 (see focal_10k_config_v30.yml for the full setup and its failure): SAME dataset
+# (train_5007, 5,007 species incl. the 7 known focal species, no curation, universal
+# focal_head_dim=256), but with 4 stability fixes after v30 diverged (85% of 5,007 classes
+# collapsed to near-zero output by epoch 7, epoch loss climbing monotonically from epoch 5):
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v31.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <all 5007 taxon_ids - see
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('train_5007_unique_taxa.npy')))"` > \
+#     --pos_weight 2.25 --focal_head_dim 256 --bg_base_weight 1.5 \
+#     --pos_weight_balance_exponent 0.5 --grad_clip_value 1.0 --stability_check --no_wandb
+#
+# 1. --pos_weight_balance_exponent 0.5 (new in train_tf_sinr_test.py/sinr_loss.py): pos_weight
+#    is now a per-class vector, scaled by (median_count/class_count)^0.5 capped at 1.0. This
+#    dataset has a ~1000x observation-count range (100 to 100,000, median 453) this codebase has
+#    never faced before - a flat pos_weight let the highest-count classes contribute ~1000x the
+#    aggregate positive-loss gradient of the sparsest ones, the likely root cause of v30's
+#    collapse. At exponent=0.5: classes at/below the median (453 obs) keep the full 2.25 weight
+#    (unaffected); the 100,000-obs outlier gets scaled down to ~0.15.
+# 2. --grad_clip_value 1.0 (new): per-element gradient clip applied before the optimizer's
+#    existing global-norm clip (clipnorm=1.0, unconditional). clipnorm alone can't stop one
+#    output column in a 5,007-wide shared layer from absorbing a disproportionate, badly-directed
+#    share of the norm budget - this bounds any single gradient element directly.
+# 3. initial_lr 0.0005->0.0001 (5x lower): smaller steps, standard stabilizer on top of the above.
+# 4. --stability_check (new): auto-stops training (keeping all checkpoints saved so far) if
+#    epoch mean loss rises >5% for 2 consecutive epochs, rather than silently continuing for
+#    hours before anyone notices - exactly what happened with v30 (found at epoch 7 via manual
+#    check, loss had already been climbing since epoch 5).
+#
+# Everything else identical to v30: same 5,007-species dataset, same focal_head_dim=256, no
+# focal_oversample/range_penalty_scale (still doesn't make sense with no curation).
+#
+# v31 RESULT: ALSO diverged, faster this time - the --stability_check safety net worked exactly
+# as designed and auto-stopped after epoch 3 (loss climbing 1.3684->1.5627->1.7293, >5% for 2
+# consecutive epochs), saving ~9 hours vs v30's manual-discovery-at-epoch-7. But every one of the
+# 7 known species' sensitivity DECLINED monotonically epoch over epoch (Pika 0.110->0.064->0.044,
+# Ant 0.034->0.009->0.015) - a uniform downward drift across all species, not v30's pattern of
+# most classes going fully dead while a few stayed fine.
+#
+# Root cause of THIS failure: pos_weight_balance_exponent=0.5, capped at 1.0 (never boosts
+# below-median classes above the base weight), only reduces high-count classes - but those
+# high-count classes dominate how often ANY positive example appears in a batch at all. The
+# observation-count-weighted average pos_weight scale came out to just 0.27 - i.e. this fix
+# shrank the TOTAL aggregate positive-loss signal to ~27% of the old flat-2.25 baseline, while
+# background/absence pressure (bg_base_weight, effort_scale) was completely unchanged. That
+# imbalance - not gradient instability this time - explains the uniform decay toward absence
+# for every species. This also reframes v30's failure: the old flat-pos_weight recipe
+# (bg_base_weight=1.5, effort_scale=5.0) was tuned years ago for a dataset where oversampling
+# compensated for sparse classes; with no oversampling and a real ~1000x count skew, absence
+# pressure may simply be too strong relative to positive pressure regardless - v30's "sudden"
+# epoch-5 collapse may have been the same slow drift finally crossing a tipping point, which
+# this pos_weight fix (by weakening positive pressure further) made manifest faster, not slower.
+#
+# Fix attempted in v32 (focal_10k_config_v32.yml): gentler pos_weight_balance_exponent (0.2, not
+# 0.5) AND directly compensate by scaling bg_base_weight/effort_scale down by the same
+# weighted-average factor the positive signal lost, restoring the original relative balance
+# instead of just shrinking positive pressure unilaterally.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0001
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v31.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

@@ -1,0 +1,64 @@
+# v32 vs v31 (see focal_10k_config_v31.yml for full detail): SAME dataset (train_5007, 5,007
+# species incl. the 7 known focal species, no curation, universal focal_head_dim=256) and same
+# stability fixes (grad_clip_value, lower LR, stability_check), but a corrected pos_weight
+# rebalancing approach after v31 also diverged - not from gradient instability this time, but
+# from an unintended loss-BALANCE error.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v32.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <all 5007 taxon_ids - see
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('train_5007_unique_taxa.npy')))"` > \
+#     --pos_weight 2.25 --focal_head_dim 256 --bg_base_weight 0.82 \
+#     --pos_weight_balance_exponent 0.2 --grad_clip_value 1.0 --stability_check --no_wandb
+#
+# What changed vs v31:
+# 1. --pos_weight_balance_exponent 0.5 -> 0.2 (gentler correction - still de-weights the most
+#    extreme high-count classes, capped at 1.0 so no class exceeds the base 2.25 weight, but
+#    less aggressively than 0.5 did).
+# 2. --bg_base_weight 1.5 -> 0.82, and effort_scale (below) 5.0 -> 2.73: v31's pos_weight
+#    rebalancing shrank the TOTAL aggregate positive-loss signal to ~27% of baseline (since the
+#    highest-count classes it de-weighted are exactly the ones that dominate how often ANY
+#    positive example appears at all), while absence-pressure (bg_base_weight/effort_scale) was
+#    left completely unchanged - that imbalance, not gradient instability, caused every one of
+#    the 7 known species to decay monotonically toward zero over 3 epochs. At exponent=0.2, the
+#    observation-count-weighted-average pos_weight scale is 0.547 (computed directly from
+#    train_5007's actual class distribution) - bg_base_weight and effort_scale are scaled down
+#    by that same 0.547 factor (1.5*0.547=0.82, 5.0*0.547=2.73) to restore the original relative
+#    balance between positive and absence pressure, rather than just weakening positive pressure
+#    unilaterally the way v31 did.
+#
+# Everything else identical to v31: initial_lr=0.0001, grad_clip_value=1.0, stability_check on,
+# focal_head_dim=256, no focal_oversample/range_penalty_scale.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0001
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v32.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 2.73
+
+sinr_hyperparams:
+    pos_weight: 2.25

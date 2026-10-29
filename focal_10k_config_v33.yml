@@ -1,0 +1,118 @@
+# NEW DIRECTION after v30/v31/v32 (see focal_10k_config_v30/v31/v32.yml): those three attempts
+# tried applying the dedicated-head mechanism UNIVERSALLY to all 5,007 species with NO
+# curation, and failed three different ways (dead output units, uniform decay, uniform
+# non-species-specific collapse). Course correction: the actual goal was never "prove
+# curation is unnecessary" - it's that across ~30 shared-backbone-only runs (v1-v27), even
+# WELL-SAMPLED species (Pika, Millipede, etc., 1-13k real obs, already given full data +
+# focal_oversample + range_penalty + 20+ rounds of hyperparameter tuning) never achieved
+# accurate ranges. Only the dedicated architectural head (v28) fixed that, on the first try.
+# So the right question isn't "does the mechanism survive zero curation" - it's "does the
+# mechanism that actually worked scale from a hand-picked 7 to an automatically-selected,
+# larger group, without breaking."
+#
+# v33: scale the WORKING v28 recipe to 500 automatically-selected species (not hand-picked, not
+# all 5,007) - a middle step between "7 by name" and "all 5,007 with zero curation."
+#
+# Species selection (see group500_taxa.npy, built via a one-off script - not yet a committed
+# tool, recreate via: stratify train_5007's 5,000 species by log10(observation count) into 10
+# bins, sample ~49/bin with seed=42, then union with the 7 known focal taxa to guarantee direct
+# comparability to v22/v28/v29/v30-32's results). Selected group spans the full skew (100 to
+# 100,000 obs, median 2,539) same as train_5007 overall.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v33.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <500 taxon_ids - see group500_taxa.npy, comma-join via
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('group500_taxa.npy')))"` > \
+#     --pos_weight 2.25 --focal_head_dim 128 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --stability_check --no_wandb
+#
+# Key differences from v30-32 (moving BACK toward the known-good v22/v28 recipe, not away from
+# it) and from v28 (scaling UP, not just reproducing):
+# - focal_taxa: 500 automatically-selected species, not 7 hand-picked ones.
+# - --oversample_target_exponent 1.0 (NEW, replaces flat --focal_oversample): per-species
+#   oversample factor = round(clip(median_group_count/class_count, 1, 20)). At this group's
+#   median (2,539 obs), the well-sampled known species (Pika/Millipede/Lily/Crab/Lewisia, already
+#   above median) get factor=1 (no boost needed - matches how little they needed in v28 beyond
+#   the head itself), while genuinely sparse members get boosted proportionally (Amorph 1,460
+#   obs -> 2x, Ant 180 obs -> 14x). A flat factor (like v28's uniform 5x) doesn't make sense once
+#   the group spans 100 to 100,000 obs instead of a hand-picked cluster of similar-ish sizes.
+# - bg_base_weight=1.5, effort_scale=5.0 (below), pos_weight=2.25, range_penalty_scale=3.0,
+#   initial_lr=0.0005 (below): ALL restored to v22/v28's known-good values, not v30-32's emergency
+#   rebalancing - that rebalancing was only needed to compensate for zero-oversampling across a
+#   huge skew with no curation, which no longer applies now that the selected group gets proper
+#   per-species oversampling.
+# - focal_head_dim 64->128: modest increase for 500 classes vs 7, without jumping to v30-32's 256
+#   (which serves 5,007 and diluted per-class attention badly).
+# - grad_clip_value=1.0 and --stability_check kept ON as safety nets regardless - cheap, and
+#   already proved useful for catching a real divergence early in v31.
+#
+# EVALUATE: visualize_combined.py/check_specificity.py on the 7 known species first (direct
+# comparison to v22 ~0.920 avg specificity, v28 ~0.984), then spot-check other group members
+# across the sample-size spectrum to see whether ranges hold up broadly, not just for the 7.
+#
+# v33 RESULT: ALSO failed, same underlying mechanism as v30 despite proper oversampling and
+# restored known-good hyperparameters - just slower and initially hidden. --stability_check
+# auto-stopped at epoch 5 (loss climbing 2.36->2.56->2.78). Epochs 1-3 looked genuinely
+# promising for the 7 known species (unlike v30-32's immediate uniform collapse), but Crab and
+# Ant both degraded sharply by epoch 5 (Crab: massive global overprediction across Africa/S.
+# America/S+SE Asia; Ant specificity collapsed to 0.519, worse than v22's original 0.743). A
+# random sample of 60 OTHER (non-named) group members at epoch 5 showed 31/60 (~half) had
+# COMPLETELY DEAD output (mean_pred=0.0000 at their own real observation points) - the identical
+# failure mode as v30, just partially masked because monitoring only tracked the 7 named
+# species, 5 of which happened to survive to epoch 5 by chance.
+#
+# ROOT CAUSE (mechanistic, not just another hyperparameter): the shared secondary head's final
+# layer starts every one of its N classes at IDENTICAL zero weights (deliberate, so it's a
+# no-op at epoch 0). Training must break symmetry between however many classes share that one
+# small hidden bottleneck. Classes-per-hidden-unit ratio predicts failure severity cleanly:
+#   v28: N=7,    head_dim=64  -> 0.11 classes/unit -> perfect maps
+#   v33: N=500,  head_dim=128 -> 3.9  classes/unit -> ~50% dead by epoch 5
+#   v30: N=5007, head_dim=256 -> 19.6 classes/unit -> ~85% dead by epoch 7
+# Once a class's output logit drifts negative enough under this competition, the sigmoid
+# saturates and its gradient vanishes - permanently stuck near zero, unrecoverable. This is a
+# genuine capacity/competition bottleneck in the shared bottleneck, not a loss-balance or LR
+# problem - none of v31/v32/v33's fixes addressed it because they targeted the wrong
+# mechanism. Fixing it honestly would require head_dim to scale roughly in proportion to N to
+# preserve v28's safe ratio (e.g. ~4,500+ units for 500 classes) - at that size the "small
+# dedicated head" is no longer small, defeating the entire point of the mechanism.
+#
+# CONCLUSION: stopped pursuing scaling this mechanism past a small, curated group. v28's recipe
+# (focal_10k_config_v28.yml, 7 species, head_dim=64) is the validated, correct answer for
+# Pika/Millipede/Lily/Crab/Lewisia/Amorph/Ant specifically. The broader ~120k-species goal needs
+# a structurally different mechanism (most plausibly per-species embeddings scored against a
+# shared representation, which doesn't share one bottleneck across many competing classes by
+# construction) as a SEPARATE research effort, not a v34 patch on this same architecture.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v33.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

@@ -1,0 +1,79 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v25.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --bg_base_weight 1.5 --hard_neg_scale 1.0 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v22 = ACCEPTED BASELINE (bugfix + effort_scale=5.0 + bg_base_weight=1.5, no hard-negative
+# mining), copied to baseline_v22_accepted.keras. Specificity: Pika 0.990, Millipede 0.919,
+# Lily 0.964, Crab 0.939, Lewisia 0.942, Amorph 0.943, Ant 0.743 (avg ~0.920).
+#
+# v23 (bg_base_weight 1.5->2.0, everything else unchanged) was a clear REGRESSION - a flat,
+# uniform-pressure knob past its sweet spot compresses presence and absence scores together
+# rather than sharpening the boundary. Not pursuing bg_base_weight further; checkpoints deleted.
+#
+# v24 (range_penalty_scale 3.0->4.0, everything else back to v22) was ALSO a clear regression,
+# same failure mode as v23 despite being distance-conditioned rather than flat: avg specificity
+# ~0.818 vs v22's ~0.920, sensitivity unchanged. Not pursuing range_penalty_scale further;
+# checkpoints deleted. v22 remains the accepted baseline.
+#
+# v25 vs v22: different KIND of lever - hard_neg_scale 0.0->1.0 (everything else identical to
+# v22: bg_base_weight 1.5, range_penalty_scale 3.0, effort_scale 5.0). Unlike the two blanket/
+# distance-conditioned levers that both regressed, hard-negative mining is PREDICTION-
+# conditioned: it multiplies the existing background weight by (1 + hard_neg_scale *
+# model's own current prediction^gamma) at each absence point, so it only adds extra pressure
+# where the model is CURRENTLY overconfident, rather than uniformly or by distance. Hypothesis:
+# this targets actual false positives directly instead of compressing all presence/absence
+# scores together, so it shouldn't hit the same failure mode as v23/v24.
+#
+# v25 RESULT: ALSO a net regression vs v22, avg specificity ~0.834 vs ~0.920, though with a
+# different pattern than v23/v24 - Pika (most training data) actually improved slightly
+# (0.990->0.995), but every other species dropped, worst on the sparser-data species: Amorph
+# 0.943->0.793, Ant 0.743->0.607, Millipede 0.919->0.795, Crab 0.939->0.834, Lily 0.964->0.910,
+# Lewisia 0.942->0.906. Sensitivity held up fine, so not a convergence problem. Conclusion:
+# even a prediction-conditioned lever (not blanket/distance-based like v23/v24) still hurts
+# specificity broadly when added on top of v22 - three different absence-pressure mechanisms
+# in a row have now regressed. The model may be near its ceiling for these settings; further
+# gains likely need something other than "add more absence pressure" on top of v22 (e.g.
+# addressing Ant/Amorph's sparse data directly, or a different lever entirely). Not pursuing
+# hard_neg_scale further; v25 checkpoints deleted. v22 remains the accepted baseline.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v25.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

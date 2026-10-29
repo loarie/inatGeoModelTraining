@@ -1,0 +1,94 @@
+# v36 vs v35: same IndependentPerClassHead architecture (validated - 0/60 sampled classes hit
+# the shared-bottleneck collapse criterion, and directly inspecting a "stuck" class's W1/W2/b2
+# showed they'd moved substantially off zero-init with normally-firing hidden units - so the
+# architecture is doing its job). What v35 exposed instead: roughly half of the 500-species group
+# (Millipede/Lily/Crab/Amorph/Ant among the 7 known species, ~half of a 60-species sample of the
+# other 493) ran away to permanently-saturating negative logits (Crab reached -50 by epoch 4,
+# still drifting further negative every epoch, never recovering) while the other half (Pika,
+# Lewisia) converged cleanly to >0.98.
+#
+# ROOT CAUSE (see sinr_loss.py's docstring for the full mechanism): sinr_loss computed
+# -log(sigmoid(x)+1e-5) directly on the model's sigmoid-probability output rather than on the
+# pre-sigmoid logit. Once a class's true probability underflowed below that 1e-5 eps (which
+# several classes did well before their logits reached anything near float32's actual underflow
+# point), loss_pos flattened to a near-constant and stopped contributing gradient at all, while
+# loss_bg's per-example gradient also vanished - leaving only the much larger background pool's
+# shrinking-but-still-nonzero pull in the same (wrong) direction, with nothing to correct it. This
+# had nothing to do with cross-class weight sharing - a purely numerical trap in the loss
+# function's probability-space formulation, present in EVERY prior run (v30-v35) but only
+# diagnosable once the architecture fix (independent heads) ruled out the shared-bottleneck
+# explanation for the same symptom.
+#
+# NEW: sinr_loss.py rewritten to operate on logits via tf.nn.softplus (numerically-stable
+# log(1+exp(.))), matching the standard logits-based binary cross-entropy identity:
+#   -log(sigmoid(x))   = softplus(-x)   (loss_pos)
+#   -log(1-sigmoid(x))  = softplus(x)    (loss_bg)
+# This keeps a bounded, non-vanishing gradient (saturating at -1/+1, never 0) no matter how
+# confidently wrong a class's current prediction is, so a class can climb back out even from a
+# very wrong starting point. train_tf_sinr_test.py now builds a `logits_model` view sharing
+# fcnet's weights (via fcnet.get_layer("predictions").input, the pre-Activation("sigmoid")
+# tensor) and trains against that instead of fcnet's sigmoid output; fcnet itself and every saved
+# checkpoint are UNCHANGED - still a single sigmoid-output model, so all existing eval/
+# visualization scripts (visualize_combined.py, check_specificity.py) work unmodified.
+#
+# Verified before this run: at logit=-50 (the old loss's gradient here was ~3.9e-17, i.e. dead),
+# the new loss gives gradient -0.5/batch_size - the correct, healthy, non-vanishing magnitude.
+#
+# Fresh run from scratch (NOT resumed from any v35 checkpoint) - several v35 classes are already
+# deep in the old loss's numerically-broken regime; a clean run is the honest test of whether the
+# loss fix alone (same architecture, same data, same hyperparameters otherwise) prevents the
+# runaway in the first place.
+#
+# EVERYTHING else identical to v35 - same train_5007 dataset, same 500-species group
+# (group500_taxa.npy), same per-species oversampling, same restored v22/v28 hyperparameters:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v36.yml \
+#     --train_npy train_5007 --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa <500 taxon_ids - see
+#       `python3 -c "import numpy as np; print(','.join(str(t) for t in np.load('group500_taxa.npy')))"` > \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --stability_check --no_wandb
+#
+# EVALUATE: same protocol as v33/v34/v35 - visualize_combined.py/check_specificity.py on the 7
+# known species AND a random sample of the other ~493 group members (checking mean_pred at their
+# own real observation points for dead-class collapse), not just the 7.
+#
+# If this fixes the runaway: strong evidence the loss's probability-space formulation (not the
+# architecture) was the remaining failure mode - worth then testing at v30's larger N=5,007 scale.
+# If classes still run away even with the numerically-stable loss: something else is driving the
+# early imbalance (e.g. per-class positive/background sample ratio in a typical batch) hard enough
+# to matter even with a non-vanishing gradient - next lever would be pos_weight_balance_exponent.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v36.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

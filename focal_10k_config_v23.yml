@@ -1,0 +1,62 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v23.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.25 --focal_oversample 5 --range_penalty_scale 3.0 \
+#     --bg_base_weight 2.0 --no_wandb
+#
+# EVALUATE WITH BOTH: visualize_combined.py (sensitivity) AND check_specificity.py.
+#
+# v22 = ACCEPTED BASELINE (bugfix + effort_scale=5.0 + bg_base_weight=1.5, no hard-negative
+# mining), copied to baseline_v22_accepted.keras. Specificity: Pika 0.990, Millipede 0.919,
+# Lily 0.964, Crab 0.939, Lewisia 0.942, Amorph 0.943, Ant 0.743 (avg ~0.920) - best bug-fixed
+# model yet, closest to v11's ~0.930, and Lily/Lewisia/Amorph now match or beat v11 outright.
+# One tradeoff: Amorph sensitivity dropped a lot (0.937->0.589 on the visual check), fragmented/
+# patchy predicted range - the model got notably more conservative calling presence for that
+# species (only 1,460 training points, so more exposed to this than the data-rich species).
+#
+# v23 vs v22: single-lever continuation - bg_base_weight 1.5->2.0, everything else unchanged.
+# Goal: more resistance to false positives; Ant specifically is lower priority.
+# bg_base_weight was chosen as the lever to keep pushing (rather than effort_scale, which
+# proved noisy/non-monotonic across runs - see v21 - or hard-negative mining, which has a
+# documented history of destabilizing Lewisia/Crab - see v13/v19) because it was the one clean,
+# single-direction win so far: 1.0->1.5 improved specificity broadly with no per-species
+# regressions. Watch Amorph's sensitivity closely - it was already trending toward
+# over-conservative at 1.5, so 2.0 could push further in that direction.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v23.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

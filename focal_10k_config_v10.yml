@@ -1,0 +1,65 @@
+# IMPORTANT: focal species (Pika, Millipede, Lily, Crab, Lewisia, Amorph, Ant) will train flat
+# (~0.5 predictions everywhere) at this scale unless launched with focal oversampling and
+# target-group background sampling. Without these, each focal species' presence points get
+# drowned out by thousands of competing background species. Train with:
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v10.yml \
+#     --train_npy train_10k_focal_clean --bg_sampling target_group \
+#     --bg_tg_fraction 0.65 --num_epochs 20 \
+#     --focal_taxa 43188,47360,47737,51315,54952,57358,472214 \
+#     --pos_weight 2.0 --focal_oversample 5 --range_penalty_scale 3.0 --no_wandb
+#
+# (v1-v6: see focal_10k_config_v6.yml. v7/v8: see focal_10k_config_v8.yml.)
+#
+# v9 vs v8: added clipnorm=1.0 to the Adam optimizer (fix for v8's per-epoch loss bouncing) AND
+# simultaneously halved range_penalty_scale 3.0->1.5 / cap 5.0->3.0 (thinking the range penalty
+# itself was too spiky). WRONG on the second half: clipnorm alone fixed the instability (loss
+# went from bouncing ~2.8x per epoch to a smooth monotonic decline) and local/near-point range
+# quality was the best yet (Ant p10 jumped to 0.943, sharpest ever) - but the weakened range
+# penalty was no longer strong enough to counteract pos_weight=2.0 now that optimization could
+# fully converge instead of oscillating. Result: ALL 7 species collapsed to an identical
+# degenerate prediction of EXACTLY 1.0 at the same handful of locations (Chad/Niger, Central
+# Asia, Antarctica) - confirmed via direct model query this is NOT per-species climate
+# extrapolation (which would differ by species) but a shared embedding saturating uniformly
+# regardless of species. Also confirmed the raw input covariates at those locations are NOT
+# extreme (max |value| 0.5-1.9, unremarkable) - ruling out an input-scaling bug. The real cause:
+# range_penalty was cut in the same change as clipnorm, and stable optimization let the model
+# fully commit to violating a too-weak constraint instead of being kept in check by v8's
+# instability.
+#
+# v10 vs v9: keep clipnorm=1.0 (it's genuinely good - sharper local ranges, best Ant result yet),
+# revert range_penalty_scale back to 3.0 and cap back to 5.0 (v8's original strength) now that
+# it's operating in a stable optimization regime instead of a chaotic one. Goal: combine v9's
+# clean/stable/sharp local convergence with v8's proven-but-unstable extrapolation suppression.
+#
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v10.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 6.0
+
+sinr_hyperparams:
+    pos_weight: 2.0
