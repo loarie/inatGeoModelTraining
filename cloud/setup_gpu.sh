@@ -18,7 +18,8 @@ sudo apt-get update -qq && sudo apt-get install -y -qq python3-venv tmux time > 
 python3 -m venv ~/geo-venv
 source ~/geo-venv/bin/activate
 pip install -q --upgrade pip
-pip install -q -r cloud/requirements-gpu.txt
+# --timeout/--retries: a stalled download otherwise hangs pip indefinitely
+pip install -q --timeout 60 --retries 10 -r cloud/requirements-gpu.txt
 
 python - <<'EOF'
 import tensorflow as tf
