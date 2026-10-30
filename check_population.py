@@ -13,6 +13,7 @@ Usage:
   python3 check_population.py --model focal_10k_model_v40.epoch006.keras --config focal_10k_config_v40.yml
 """
 import argparse
+import os
 import pickle
 from collections import defaultdict
 
@@ -51,6 +52,32 @@ def build_or_load_cell_stats(locs, cids, train_npy):
     return cell_to_species, cell_count
 
 
+def make_focal_scorer(model, class_ids):
+    """fn(encoded inputs) -> (n, len(class_ids)) predicted probabilities for just class_ids.
+    For focal-head models, computes only those columns of the shared output layer (plus the
+    focal head) instead of all num_classes: at 120k classes the full output is ~240x the work
+    and, at 8192 rows, a ~4GB array per batch. Other models fall back to the full forward pass."""
+    scatter = next((l for l in model.layers if isinstance(l, FocalScatterAdd)), None)
+    if scatter is None:
+        return lambda x: model(x, training=False).numpy()[:, class_ids]
+    shared = next(l for l in model.layers
+                  if isinstance(l, tf.keras.layers.Dense) and l.units == scatter.num_classes)
+    head = next(l for l in model.layers if isinstance(l, (IndependentPerClassHead, tf.keras.layers.Dense))
+                and l is not shared and l.output is scatter.input[1])
+    features = tf.keras.Model(model.input, [shared.input, head.output])
+    kernel = tf.gather(shared.kernel, class_ids, axis=1)
+    bias = tf.gather(shared.bias, class_ids) if shared.use_bias else 0.0
+    head_col = {c: i for i, c in enumerate(scatter.indices)}
+    head_idx = tf.constant([head_col.get(c, 0) for c in class_ids])
+    head_mask = tf.constant([float(c in head_col) for c in class_ids])
+
+    def score(x):
+        h, f = features(x, training=False)
+        logits = tf.matmul(h, kernel) + bias + tf.gather(f, head_idx, axis=1) * head_mask
+        return tf.sigmoid(logits).numpy()
+    return score
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -61,6 +88,9 @@ def main():
     ap.add_argument("--group", default="group500_taxa.npy",
                     help="focal 500-taxa group the model was trained with (v41+: group500_taxa_v41.npy)")
     ap.add_argument("--out_csv", default=None, help="optional per-taxon taxon_id,mean,specificity dump")
+    ap.add_argument("--absence_npy", default=None,
+                    help="take the true-absence cells from this dataset instead of --train_npy, so "
+                         "models trained on different datasets are scored against the same cells")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -74,7 +104,20 @@ def main():
     group500 = np.load(args.group)
     focal_class_ids = [int(np.where(unique_taxa == tid)[0][0]) for tid in group500 if tid in unique_taxa]
 
-    cell_to_species, cell_count = build_or_load_cell_stats(locs, cids, args.train_npy)
+    if args.absence_npy and args.absence_npy != args.train_npy:
+        # absence sets hold the absence dataset's class ids: translate the focal ids by taxon
+        abs_taxa = np.load(f"{args.absence_npy}_unique_taxa.npy")
+        abs_class_of = {int(abs_taxa[i]): i for i in range(len(abs_taxa))}
+        cache = f"h3_cell_stats_{args.absence_npy}.pkl"
+        abs_locs = abs_cids = None
+        if not os.path.exists(cache):
+            abs_locs = np.load(f"{args.absence_npy}_locs.npy")
+            abs_cids = np.load(f"{args.absence_npy}_class_ids.npy")
+        cell_to_species, cell_count = build_or_load_cell_stats(abs_locs, abs_cids, args.absence_npy)
+        absence_class = {c: abs_class_of.get(int(unique_taxa[c]), -1) for c in focal_class_ids}
+    else:
+        cell_to_species, cell_count = build_or_load_cell_stats(locs, cids, args.train_npy)
+        absence_class = {c: c for c in focal_class_ids}
     high_count_cells = [c for c, n in cell_count.items() if n >= args.min_obs]
     cell_latlon = np.array([h3.h3_to_geo(c) for c in high_count_cells])
     cell_locs = np.stack([cell_latlon[:, 1], cell_latlon[:, 0]], axis=1)
@@ -86,11 +129,10 @@ def main():
         args.model, custom_objects={"FocalScatterAdd": FocalScatterAdd, "IndependentPerClassHead": IndependentPerClassHead}
     )
 
-    all_cell_preds = []
-    for start in range(0, len(encoded_cells), 4096):
-        batch = model(encoded_cells[start:start + 4096, :-1], training=False).numpy()
-        all_cell_preds.append(batch[:, focal_class_ids])
-    all_cell_preds = np.concatenate(all_cell_preds)
+    score_focal = make_focal_scorer(model, focal_class_ids)
+    all_cell_preds = np.concatenate([
+        score_focal(encoded_cells[start:start + 4096, :-1]) for start in range(0, len(encoded_cells), 4096)
+    ])
 
     means, specs = {}, {}
     for i, cidx in enumerate(focal_class_ids):
@@ -100,12 +142,12 @@ def main():
         enc_presence = encoder.encode(sp_locs)
         scores = []
         for start in range(0, len(enc_presence), 8192):
-            scores.append(model(enc_presence[start:start + 8192, :-1], training=False).numpy()[:, cidx])
+            scores.append(score_focal(enc_presence[start:start + 8192, :-1])[:, i])
         scores = np.concatenate(scores)
         means[cidx] = scores.mean()
 
         thresh = float(np.percentile(scores, args.percentile))
-        absent_mask = np.array([cidx not in cell_to_species[c] for c in high_count_cells])
+        absent_mask = np.array([absence_class[cidx] not in cell_to_species[c] for c in high_count_cells])
         preds_here = all_cell_preds[absent_mask, i]
         if len(preds_here) > 0:
             specs[cidx] = 1 - (preds_here >= thresh).mean()
