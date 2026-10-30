@@ -194,13 +194,17 @@ def build_cell_presence_bits(train_cell_ids, class_ids, n_cells, num_classes):
     ~168MB at 25k classes / 54k occupied cells; ~1.2GB at 120k classes. Replaces a ragged
     cell->classes lookup whose per-step gather/padding ran off the GPU and scaled with the
     busiest cell (3,066 classes in one cell at 25k classes -> 1.57M padded pairs per step)."""
-    pairs = np.unique(np.stack([train_cell_ids.astype(np.int64), class_ids.astype(np.int64)], axis=1), axis=0)
-    occupied, row_of_pair = np.unique(pairs[:, 0], return_inverse=True)
+    # unique (cell, class) pairs via a single int64 key - np.unique(axis=0) on an (N, 2) array
+    # makes several full copies, which adds up at 148M points
+    keys = np.unique(train_cell_ids.astype(np.int64) * num_classes + class_ids)
+    pair_cells, pair_classes = keys // num_classes, keys % num_classes
+    del keys
+    occupied, row_of_pair = np.unique(pair_cells, return_inverse=True)
     bits = np.zeros((len(occupied) + 1, (num_classes + 7) // 8), dtype=np.uint8)
-    np.bitwise_or.at(bits, (row_of_pair + 1, pairs[:, 1] >> 3), (1 << (pairs[:, 1] & 7)).astype(np.uint8))
+    np.bitwise_or.at(bits, (row_of_pair + 1, pair_classes >> 3), (1 << (pair_classes & 7)).astype(np.uint8))
     cell_row = np.zeros(n_cells, dtype=np.int64)  # int64: int32 tensors stay in host memory
     cell_row[occupied] = np.arange(1, len(occupied) + 1, dtype=np.int64)
-    print(f"  {len(occupied):,} occupied H3 cells, {len(pairs):,} cell-species pairs, "
+    print(f"  {len(occupied):,} occupied H3 cells, {len(pair_cells):,} cell-species pairs, "
           f"presence table {bits.nbytes / 1e6:.0f}MB")
     return tf.constant(cell_row), tf.constant(bits)
 
@@ -220,6 +224,9 @@ def build_cell_range_penalty(cells, focal_class_ids, locs, class_ids, scale, nor
     return table
 
 
+PREDICT_CHUNK = 4096  # rows per forward pass in adapt_pos_weight (4096 x 120k classes = 2GB)
+
+
 def adapt_pos_weight(fcnet, encoder, locs, class_ids, watch_class_ids, pos_weight_np,
                       base_pos_weight, threshold, factor, max_multiple):
     """In-loop closed-loop controller: for each class in watch_class_ids, evaluate its current mean
@@ -232,8 +239,14 @@ def adapt_pos_weight(fcnet, encoder, locs, class_ids, watch_class_ids, pos_weigh
         sp_locs = locs[class_ids == cid]
         if len(sp_locs) == 0:
             continue
-        enc = encoder.encode(sp_locs)
-        preds = fcnet(enc[:, :-1], training=False).numpy()[:, cid]
+        # in chunks, keeping only column cid on-device: one pass over a common focal species'
+        # ~100k points used to materialize a (points x num_classes) array - 9.8GB of host RAM
+        # at 25k classes, ~47GB (more than fits beside training on the GPU) at 120k
+        preds = np.concatenate([
+            tf.gather(fcnet(encoder.encode(sp_locs[i:i + PREDICT_CHUNK])[:, :-1], training=False),
+                      cid, axis=1).numpy()
+            for i in range(0, len(sp_locs), PREDICT_CHUNK)
+        ])
         if preds.mean() < threshold:
             cap = base_pos_weight * max_multiple
             pos_weight_np[cid] = min(pos_weight_np[cid] * factor, cap)
@@ -260,16 +273,21 @@ def _subsample_indices(hard_cap, class_ids, focal_class_ids=None):
     if hard_cap == -1:
         return np.arange(len(class_ids))
     print(f"  subsampling (up to) {hard_cap} per class for the training set")
-    class_counts = {c: 0 for c in np.unique(class_ids)}
+    # a uniform random hard_cap points of each class (all points of focal classes): visit points
+    # in random order and keep each one whose rank within its class is < hard_cap. Vectorized -
+    # the equivalent per-point Python loop took minutes and GBs of Python ints at 148M points.
     rng = np.random.default_rng()
     idx_rand = rng.permutation(len(class_ids))
-    idx_ss = []
-    for i in idx_rand:
-        c = class_ids[i]
-        if c in focal_set or class_counts[c] < hard_cap:
-            idx_ss.append(i)
-            class_counts[c] += 1
-    return np.sort(idx_ss)
+    cls = class_ids[idx_rand]
+    order = np.argsort(cls, kind="stable")  # by class, random order within each class
+    sorted_cls = cls[order]
+    group_start = np.searchsorted(sorted_cls, sorted_cls, side="left")
+    rank = np.empty(len(cls), dtype=np.int64)
+    rank[order] = np.arange(len(cls)) - group_start
+    keep = rank < hard_cap
+    if focal_set:
+        keep |= np.isin(cls, list(focal_set))
+    return np.sort(idx_rand[keep])
 
 
 def make_subsampled_dataset_focal(
