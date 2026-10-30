@@ -189,7 +189,7 @@ def h3_cell_ids(lonlat, cell_to_id, res):
 
 def build_cell_presence_bits(train_cell_ids, class_ids, n_cells, num_classes):
     """Which classes were observed in each H3 cell, as a packed bitmask on-device:
-      cell_row: (n_cells,) int32, global cell id -> row of `bits` (0 = an all-zero row)
+      cell_row: (n_cells,) int64, global cell id -> row of `bits` (0 = an all-zero row)
       bits:     (n_occupied + 1, ceil(num_classes / 8)) uint8, bit (k % 8) of byte k // 8 = class k
     ~168MB at 25k classes / 54k occupied cells; ~1.2GB at 120k classes. Replaces a ragged
     cell->classes lookup whose per-step gather/padding ran off the GPU and scaled with the
@@ -198,8 +198,8 @@ def build_cell_presence_bits(train_cell_ids, class_ids, n_cells, num_classes):
     occupied, row_of_pair = np.unique(pairs[:, 0], return_inverse=True)
     bits = np.zeros((len(occupied) + 1, (num_classes + 7) // 8), dtype=np.uint8)
     np.bitwise_or.at(bits, (row_of_pair + 1, pairs[:, 1] >> 3), (1 << (pairs[:, 1] & 7)).astype(np.uint8))
-    cell_row = np.zeros(n_cells, dtype=np.int32)
-    cell_row[occupied] = np.arange(1, len(occupied) + 1, dtype=np.int32)
+    cell_row = np.zeros(n_cells, dtype=np.int64)  # int64: int32 tensors stay in host memory
+    cell_row[occupied] = np.arange(1, len(occupied) + 1, dtype=np.int64)
     print(f"  {len(occupied):,} occupied H3 cells, {len(pairs):,} cell-species pairs, "
           f"presence table {bits.nbytes / 1e6:.0f}MB")
     return tf.constant(cell_row), tf.constant(bits)
@@ -657,9 +657,11 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     bg_locs_tf = None if bg_pool_raw is None else (
         train_locs_tf if bg_pool_raw is locs else tf.constant(bg_pool_raw)
     )
-    bg_cells_tf = None if bg_pool_cells is None else tf.constant(bg_pool_cells)
+    # int64, not int32: TF keeps int32 tensors in host memory, so each per-step gather from a
+    # 34M-entry int32 table copied the whole table (26.7ms vs 0.56ms per 512-gather on an H100)
+    bg_cells_tf = None if bg_pool_cells is None else tf.constant(bg_pool_cells.astype(np.int64))
     rand_locs_tf = None if rand_pool_raw is None else tf.constant(rand_pool_raw)
-    rand_cells_tf = None if rand_pool_cells is None else tf.constant(rand_pool_cells)
+    rand_cells_tf = None if rand_pool_cells is None else tf.constant(rand_pool_cells.astype(np.int64))
 
     def sample_background(batch_size):
         """(normalized background locations, their H3 cell ids or None) for one batch."""
