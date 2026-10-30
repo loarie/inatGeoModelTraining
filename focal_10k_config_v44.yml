@@ -1,0 +1,57 @@
+# v44: first pilot at scale - 25,000 species drawn at random from the full 120,500-species build
+# (train_full_v1: vision-export-20260906100011-aka-2.35 via preprocess_training_data_v3.py
+# --exclude_captive --require_community --hard_cap 10000 --random_cap --max_taxa 120000
+# --guarantee_taxa_file group500_taxa_v41.npy), always including the 500 focal species, trimmed
+# with trim_to_exact_taxa.py -> train_pilot25k_v1 (33.9M obs; pilot25k_taxa_v1.npy, seed 42).
+# Species-count distribution matches the full build (median 337 vs 331 obs/species).
+#
+# Same recipe as v43 (v42 + the random-background H3 fix), plus two changes from the GPU work:
+#   --full_shuffle: the .npy files keep each species' rows in long runs, so the old 500k-row
+#     shuffle buffer gave batches of ~163 distinct species (386 per 50-batch block, of 25k);
+#     full per-epoch shuffle gives ~480 per batch, 8,853 per block. ALL earlier runs (v2-v43)
+#     trained with the buffered shuffle. Behavior change - not comparable to v43 one-to-one.
+#   --jit_compile --steps_per_call 50: speed only.
+# Purpose: check for the scale failure modes seen before (dead classes, divergence, flat focal
+# species) at 25k classes before the full 120k run, and measure real per-epoch time.
+#
+#   python train_tf_sinr_test.py --config_file focal_10k_config_v44.yml \
+#     --train_npy train_pilot25k_v1 --bg_sampling target_group --bg_tg_fraction 0.65 \
+#     --num_epochs 15 --focal_taxa <group500_taxa_v41.npy, comma-joined> \
+#     --pos_weight 2.25 --independent_head_dim 16 --bg_base_weight 1.5 \
+#     --range_penalty_scale 3.0 --oversample_target_exponent 1.0 --oversample_max 20 \
+#     --grad_clip_value 1.0 --no_wandb \
+#     --pos_weight_adapt --pos_weight_adapt_every 3 --pos_weight_adapt_threshold 0.05 \
+#     --pos_weight_adapt_factor 2.0 --pos_weight_adapt_max 50.0 \
+#     --full_shuffle --jit_compile --steps_per_call 50
+# (cloud/run_pilot_v44.sh runs exactly this on a GPU instance.)
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 15
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_10k_model_v44.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25

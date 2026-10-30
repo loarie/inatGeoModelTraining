@@ -280,7 +280,8 @@ def _subsample_indices(hard_cap, class_ids, focal_class_ids=None):
 
 def make_subsampled_dataset_focal(
     hard_cap, class_ids, batch_size, shuffle_buffer_size,
-    focal_class_ids=None, focal_oversample=1, focal_oversample_map=None, steps_per_call=1
+    focal_class_ids=None, focal_oversample=1, focal_oversample_map=None, steps_per_call=1,
+    full_shuffle=False,
 ):
     """Dataset of blocks of shuffled batches of training-point INDICES, shape
     (<= steps_per_call, batch_size) - the step gathers and encodes the points on-device (see
@@ -309,12 +310,20 @@ def make_subsampled_dataset_focal(
         print(f"  final training set size: {len(idx)}")
 
     num_steps = len(idx) // batch_size
-    ds = tf.data.Dataset.from_tensor_slices(idx.astype(np.int64))
-    buf = ds.cardinality() if shuffle_buffer_size is None else shuffle_buffer_size
+    if full_shuffle:
+        # a fresh uniform permutation of ALL indices every epoch (the map re-runs on each pass over
+        # the dataset). The .npy files keep each species' rows in long runs, so a shuffle buffer
+        # only mixes nearby rows: with the default 500k buffer, a batch sees ~300 species at a
+        # time (of 5k in v42, of 25k in the pilot) and the epoch sweeps through species in turn.
+        ds = (tf.data.Dataset.from_tensors(tf.constant(idx.astype(np.int64)))
+              .map(tf.random.shuffle).unbatch())
+    else:
+        ds = tf.data.Dataset.from_tensor_slices(idx.astype(np.int64))
+        buf = ds.cardinality() if shuffle_buffer_size is None else shuffle_buffer_size
+        ds = ds.shuffle(buffer_size=buf)
     # full batches only (the < batch_size leftover points of each shuffled epoch are skipped),
     # grouped into blocks of steps_per_call batches for make_multi_step
-    ds = (ds.shuffle(buffer_size=buf).batch(batch_size, drop_remainder=True)
-          .batch(steps_per_call).prefetch(tf.data.AUTOTUNE))
+    ds = ds.batch(batch_size, drop_remainder=True).batch(steps_per_call).prefetch(tf.data.AUTOTUNE)
     return ds, num_steps
 
 
@@ -463,6 +472,11 @@ def make_subsampled_dataset_focal(
                    "starting weight. Saved automatically alongside every checkpoint whenever "
                    "--pos_weight_adapt is on (see {model_save_name}.epoch{N}.pos_weight.npy) - pass that "
                    "file back in here when resuming.")
+@click.option("--full_shuffle", is_flag=True, default=False,
+              help="Shuffle the whole training set every epoch instead of through the config's "
+                   "shuffle_buffer_size window. The .npy datasets keep each species' rows in long runs, "
+                   "so a 500k-row buffer only mixes ~300 species at a time. Off by default so earlier "
+                   "runs stay reproducible; recommended for anything new.")
 @click.option("--steps_per_call", default=50, type=int,
               help="Training steps run per compiled call (make_multi_step). The host syncs, logs and "
                    "updates the progress bar once per block instead of every step. 1 = per-step.")
@@ -478,7 +492,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 pos_weight_boost_taxa, pos_weight_boost_factor,
                 pos_weight_adapt, pos_weight_adapt_every, pos_weight_adapt_threshold,
                 pos_weight_adapt_factor, pos_weight_adapt_max, pos_weight_adapt_taxa,
-                pos_weight_init_file, jit_compile, steps_per_call):
+                pos_weight_init_file, jit_compile, steps_per_call, full_shuffle):
     if focal_head_dim > 0 and independent_head_dim > 0:
         raise click.UsageError("--focal_head_dim and --independent_head_dim are mutually exclusive")
     with open(config_file, "r") as f:
@@ -731,6 +745,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         focal_oversample=focal_oversample,
         focal_oversample_map=focal_oversample_map,
         steps_per_call=steps_per_call,
+        full_shuffle=full_shuffle,
     )
 
     lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
@@ -843,6 +858,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 focal_oversample=focal_oversample,
                 focal_oversample_map=focal_oversample_map,
                 steps_per_call=steps_per_call,
+                full_shuffle=full_shuffle,
             )
 
         pbar = tqdm.tqdm(total=num_train_steps_per_epoch, dynamic_ncols=True)
