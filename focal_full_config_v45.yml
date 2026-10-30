@@ -1,0 +1,41 @@
+# v45: FULL run - all 120,500 species of train_full_v1 (148,030,312 obs; built from
+# vision-export-20260906100011-aka-2.35 by preprocess_training_data_v3.py --exclude_captive
+# --require_community --hard_cap 10000 --random_cap --max_taxa 120000
+# --guarantee_taxa_file group500_taxa_v41.npy), 500 focal species with independent heads.
+#
+# Exactly the v44 25k-species pilot recipe (v42 settings + random-background H3 fix +
+# --full_shuffle), which at 25k had 0/500 stuck focal classes at every check and focal
+# specificity >= v43 (378 vs 370 at >= 0.95; 11 vs 15 below 0.5). 20 epochs instead of 30:
+# v44's loss bottomed at epoch 3 and was flat from epoch 9; checkpoints are saved every epoch.
+# Launch: cloud/run_full_v45.sh.
+dataset_type: "sinr"
+sinr_dataset:
+    train_data: "pika.csv"
+inat_dataset:
+    spatial_data: ""
+    taxonomy: ""
+
+sampling:
+    discretized_sampling: False
+    h3_resolution: 4
+
+inputs:
+    covariates: "env"
+    loc_feat_encoding: "sinusoidal_hd"
+
+elev_data: "elev_scaled.npy"
+bioclim_data: "bioclim_coast_effort_landmask_interact_scaled.npy"
+
+initial_lr: 0.0005
+lr_decay: 0.93
+num_epochs: 20
+batch_size: 512
+hard_cap: -1
+subsample_each_epoch: False
+model_save_name: "focal_full_model_v45.keras"
+shuffle_buffer_size: 500000
+hidden_dim: 512
+effort_scale: 5.0
+
+sinr_hyperparams:
+    pos_weight: 2.25
