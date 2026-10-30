@@ -2,7 +2,7 @@ import tensorflow as tf
 
 
 def sinr_loss(y_true, logits, logits_bg, pos_weight, effort_bg_matrix=None, alpha=1.0, bg_base_weight=1.0,
-              bg_effort=None, present_idx=None, present_mask=None, focal_cols=None, bg_range_penalty=None):
+              bg_effort=None, bg_present=None, focal_cols=None, bg_range_penalty=None):
     """
     SINR loss: positive examples + random background locations.
 
@@ -37,16 +37,14 @@ def sinr_loss(y_true, logits, logits_bg, pos_weight, effort_bg_matrix=None, alph
 
     effort_bg_matrix: optional float32 numpy array shape (B_bg, K).
 
-    Sparse alternative to effort_bg_matrix (same loss, never materializes a dense (B_bg, K)
-    weight matrix on the host - at ~176k classes that matrix is ~360MB per step):
+    Alternative to effort_bg_matrix (same loss) that never builds a (B_bg, K) weight matrix on
+    the host - at ~176k classes that matrix is ~360MB per step:
       bg_effort:        (B_bg,) effort_scale * effort[j], applied to every species at row j.
-      present_idx:      (P, 2) int64 (row, class) pairs where the class IS present in row j's
-                        H3 cell - their effort weight is subtracted back out.
-      present_mask:     optional (P,) 1/0 weights for present_idx, so it can be padded to a
-                        fixed length (needed under XLA).
+      bg_present:       (B_bg, K) 1 where the class IS present in row j's H3 cell - its effort
+                        weight is subtracted back out.
       focal_cols:       (F,) class indices that get a range penalty.
       bg_range_penalty: (B_bg, F) extra absence weight for those columns.
-    Pass either effort_bg_matrix or the sparse arguments, not both.
+    Pass either effort_bg_matrix or these arguments, not both.
     bg_base_weight: flat absence-pressure floor applied to every background point,
               independent of effort or range-penalty. This is the lever for
               "lower intensity where there's no presence, regardless of sampling."
@@ -71,11 +69,8 @@ def sinr_loss(y_true, logits, logits_bg, pos_weight, effort_bg_matrix=None, alph
         # minus the effort at present (row, class) pairs, plus the range penalty on focal columns
         weight_row = bg_base_weight + (bg_effort if bg_effort is not None else 0.0)
         total_bg = tf.reduce_sum(tf.reshape(weight_row, [-1, 1]) * loss_bg)
-        if bg_effort is not None and present_idx is not None:
-            present_w = tf.gather(bg_effort, present_idx[:, 0])
-            if present_mask is not None:
-                present_w *= present_mask
-            total_bg -= tf.reduce_sum(tf.gather_nd(loss_bg, present_idx) * present_w)
+        if bg_effort is not None and bg_present is not None:
+            total_bg -= tf.reduce_sum(bg_present * loss_bg * tf.reshape(bg_effort, [-1, 1]))
         if bg_range_penalty is not None:
             total_bg += tf.reduce_sum(tf.gather(loss_bg, focal_cols, axis=1) * bg_range_penalty)
         return tf.reduce_mean(loss_pos) + total_bg / tf.cast(tf.size(loss_bg), total_bg.dtype)

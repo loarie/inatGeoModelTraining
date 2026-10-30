@@ -22,7 +22,7 @@ import tensorflow as tf
 
 from lib.models.geo_model_net import make_geo_model_net_independent_head, IndependentPerClassHead
 from lib.models.encoders import CoordEncoder
-from train_tf_sinr_test import make_train_step
+from train_tf_sinr_test import make_train_step, build_cell_presence_bits
 from utils import make_rand_samples_tf
 
 N_FEATS = 56          # encoded width; the model sees N_FEATS - 1, as in training
@@ -43,7 +43,7 @@ def bench(num_classes, n_focal, batch, hidden, head_dim, jit, steps, species_per
     lengths = np.zeros(N_CELLS, np.int64)
     lengths[occupied] = rng.poisson(species_per_cell, len(occupied))
     values = rng.integers(0, num_classes, lengths.sum()).astype(np.int32)
-    cell_species = tf.RaggedTensor.from_row_lengths(values, lengths)
+    cell_presence = build_cell_presence_bits(np.repeat(np.arange(N_CELLS), lengths), values, N_CELLS, num_classes)
     cell_range_penalty = tf.constant(rng.uniform(0, 15, (N_CELLS, n_focal)).astype(np.float16))
 
     # synthetic raw training points + a reduced-resolution raster with the real channel count
@@ -63,8 +63,8 @@ def bench(num_classes, n_focal, batch, hidden, head_dim, jit, steps, species_per
         tf.keras.optimizers.Adam(1e-4, clipnorm=1.0), logits_model, encoder, train_locs, train_classes,
         sample_background, bg_base_weight=1.5, grad_clip_value=1.0,
         head_optimizer=tf.keras.optimizers.Adam(1e-4), head_weight_refs=refs,
-        effort_col=EFFORT_COL, effort_scale=5.0, cell_species=cell_species, focal_cols=focal,
-        cell_range_penalty=cell_range_penalty, jit_compile=jit, bg_batch_size=batch,
+        effort_col=EFFORT_COL, effort_scale=5.0, cell_presence=cell_presence, focal_cols=focal,
+        cell_range_penalty=cell_range_penalty, jit_compile=jit
     )
     pw = tf.constant(np.full(num_classes, 2.25, np.float32))
     idx = lambda: tf.random.uniform([batch], 0, n_points, dtype=tf.int64)

@@ -52,8 +52,8 @@ def load_sinr_dataset_from_npy(prefix):
 
 def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample_background,
                     bg_base_weight=1.0, grad_clip_value=None, head_optimizer=None,
-                    head_weight_refs=None, effort_col=None, effort_scale=0.0, cell_species=None,
-                    focal_cols=None, cell_range_penalty=None, jit_compile=False, bg_batch_size=None):
+                    head_weight_refs=None, effort_col=None, effort_scale=0.0, cell_presence=None,
+                    focal_cols=None, cell_range_penalty=None, jit_compile=False):
     """Returns a compiled train_step(idx, pos_weight) -> loss, where idx is a batch of indices
     into the training points.
 
@@ -66,19 +66,14 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
     230M). sample_background(batch_size) is a TF function returning (normalized [-1, 1]
     background locations, their H3 cell ids or None).
 
-    The background weighting is computed on-device from small per-run lookup tables instead of
-    dense (B_bg, num_classes) matrices built in numpy every step (which cost ~85ms/step at 176k
+    The background weighting is computed on-device from per-run lookup tables instead of dense
+    (B_bg, num_classes) matrices built in numpy every step (which cost ~85ms/step at 176k
     classes, plus ~150ms/step for 500 per-step KD-tree queries at v42 scale):
-      cell_species:       RaggedTensor, row per global H3 cell id -> class ids present there.
+      cell_presence:      (cell_row, bits) from build_cell_presence_bits - which classes were
+                          observed in each H3 cell, as one packed bit per class.
       cell_range_penalty: (n_cells, n_focal) range penalty per H3 cell centroid, focal_cols order.
-      bg_cells:           (B_bg,) global H3 cell id of each background point (None if unused).
-    effort_scale > 0 with cell_species enables effort weighting; cell_range_penalty enables the
-    range penalty.
-
-    jit_compile: XLA-compiles the model/loss/optimizer part of the step. XLA needs static shapes,
-    and the number of present (row, class) pairs varies per batch, so with effort weighting the
-    pair lookup runs outside the XLA region and is padded to a fixed upper bound
-    (bg_batch_size * the most classes in any one cell), with padded pairs masked out.
+    effort_scale > 0 with cell_presence enables effort weighting; cell_range_penalty enables the
+    range penalty. All shapes are static, so the whole step can be XLA-compiled (jit_compile).
 
     head_optimizer/head_weight_refs: if given, IndependentPerClassHead's own W1/b1/W2/b2 get
     updated through a SEPARATE optimizer with no clipping at all, instead of through `optimizer`
@@ -100,13 +95,11 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
     optimizer.build(other_vars)
     if head_optimizer is not None and head_vars:
         head_optimizer.build(head_vars)
-    use_effort = effort_scale > 0 and cell_species is not None
+    use_effort = effort_scale > 0 and cell_presence is not None
+    if use_effort:
+        cell_row, cell_bits = cell_presence
     focal_cols_t = tf.constant(focal_cols, dtype=tf.int32) if cell_range_penalty is not None else None
-    max_pairs = None
-    if use_effort and jit_compile:
-        if bg_batch_size is None:
-            raise ValueError("jit_compile with effort weighting needs bg_batch_size")
-        max_pairs = bg_batch_size * int(tf.reduce_max(cell_species.row_lengths()))
+    bit_shifts = tf.constant(np.arange(8, dtype=np.uint8))
 
     # copy the raster to the device now - creating it lazily inside the trace would embed a
     # 1.5GB+ constant in the graph
@@ -117,37 +110,28 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
         x_raw = tf.gather(train_locs, idx)
         ys = tf.gather(train_classes, idx)
         fake_norm, bg_cells = sample_background(tf.shape(idx)[0])
-        present_idx = present_mask = None
-        if use_effort:
-            present = tf.gather(cell_species, bg_cells)
-            present_idx = tf.stack(
-                [present.value_rowids(), tf.cast(present.flat_values, tf.int64)], axis=1
-            )
-            if max_pairs is not None:
-                n_pairs = tf.shape(present_idx)[0]
-                present_mask = tf.ensure_shape(
-                    tf.concat([tf.ones([n_pairs]), tf.zeros([max_pairs - n_pairs])], axis=0), [max_pairs]
-                )
-                present_idx = tf.ensure_shape(
-                    tf.pad(present_idx, [[0, max_pairs - n_pairs], [0, 0]]), [max_pairs, 2]
-                )
-        return core_step(x_raw, ys, fake_norm, pos_weight, bg_cells, present_idx, present_mask)
+        return core_step(x_raw, ys, fake_norm, pos_weight, bg_cells)
 
     @tf.function(reduce_retracing=True, jit_compile=jit_compile)
-    def core_step(x_raw, ys, fake_norm, pos_weight, bg_cells, present_idx, present_mask):
+    def core_step(x_raw, ys, fake_norm, pos_weight, bg_cells):
         x = encoder.encode_tf(x_raw, normalize=True)
         fake_x = encoder.encode_tf(fake_norm, normalize=False)
         with tf.GradientTape() as tape:
             logits = model(x[:, :-1], training=True)
             fake_logits = model(fake_x[:, :-1], training=True)
-            bg_effort = bg_range_penalty = None
+            bg_effort = bg_present = bg_range_penalty = None
             if use_effort:
                 bg_effort = effort_scale * fake_x[:, effort_col]
+                # unpack each background row's cell bitmask into a (B_bg, num_classes) 0/1 mask
+                packed = tf.gather(cell_bits, tf.gather(cell_row, bg_cells))
+                bits = tf.bitwise.bitwise_and(tf.bitwise.right_shift(packed[:, :, None], bit_shifts), 1)
+                n_bg, n_classes = tf.shape(fake_logits)[0], tf.shape(fake_logits)[1]
+                bg_present = tf.cast(tf.reshape(bits, [n_bg, -1])[:, :n_classes], tf.float32)
             if cell_range_penalty is not None:
                 bg_range_penalty = tf.cast(tf.gather(cell_range_penalty, bg_cells), tf.float32)
             loss = sinr_loss(
                 ys, logits, fake_logits, pos_weight, bg_base_weight=bg_base_weight,
-                bg_effort=bg_effort, present_idx=present_idx, present_mask=present_mask,
+                bg_effort=bg_effort, bg_present=bg_present,
                 focal_cols=focal_cols_t, bg_range_penalty=bg_range_penalty,
             )
 
@@ -203,12 +187,22 @@ def h3_cell_ids(lonlat, cell_to_id, res):
     )
 
 
-def build_cell_species(train_cell_ids, class_ids, n_cells):
-    """RaggedTensor with one row per global H3 cell id: the (unique) classes observed there."""
+def build_cell_presence_bits(train_cell_ids, class_ids, n_cells, num_classes):
+    """Which classes were observed in each H3 cell, as a packed bitmask on-device:
+      cell_row: (n_cells,) int32, global cell id -> row of `bits` (0 = an all-zero row)
+      bits:     (n_occupied + 1, ceil(num_classes / 8)) uint8, bit (k % 8) of byte k // 8 = class k
+    ~168MB at 25k classes / 54k occupied cells; ~1.2GB at 120k classes. Replaces a ragged
+    cell->classes lookup whose per-step gather/padding ran off the GPU and scaled with the
+    busiest cell (3,066 classes in one cell at 25k classes -> 1.57M padded pairs per step)."""
     pairs = np.unique(np.stack([train_cell_ids.astype(np.int64), class_ids.astype(np.int64)], axis=1), axis=0)
-    row_splits = np.searchsorted(pairs[:, 0], np.arange(n_cells + 1)).astype(np.int64)
-    print(f"  {len(np.unique(pairs[:, 0])):,} occupied H3 cells, {len(pairs):,} cell-species pairs")
-    return tf.RaggedTensor.from_row_splits(tf.constant(pairs[:, 1].astype(np.int32)), tf.constant(row_splits))
+    occupied, row_of_pair = np.unique(pairs[:, 0], return_inverse=True)
+    bits = np.zeros((len(occupied) + 1, (num_classes + 7) // 8), dtype=np.uint8)
+    np.bitwise_or.at(bits, (row_of_pair + 1, pairs[:, 1] >> 3), (1 << (pairs[:, 1] & 7)).astype(np.uint8))
+    cell_row = np.zeros(n_cells, dtype=np.int32)
+    cell_row[occupied] = np.arange(1, len(occupied) + 1, dtype=np.int32)
+    print(f"  {len(occupied):,} occupied H3 cells, {len(pairs):,} cell-species pairs, "
+          f"presence table {bits.nbytes / 1e6:.0f}MB")
+    return tf.constant(cell_row), tf.constant(bits)
 
 
 def build_cell_range_penalty(cells, focal_class_ids, locs, class_ids, scale, norm_deg, cap):
@@ -623,7 +617,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     effort_scale = config.get("effort_scale", 0.0)
     use_effort = effort_scale > 0 and bg_sampling == "target_group"
     use_range_penalty = range_penalty_scale > 0 and bool(focal_class_ids)
-    cell_to_id = cell_species = cell_range_penalty = None
+    cell_to_id = cell_presence = cell_range_penalty = None
     bg_pool_cells = rand_pool_cells = None
 
     # a fixed pool of uniform random background points: for target-group sampling's random
@@ -650,7 +644,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
             rand_pool_cells = h3_cell_ids(rand_pool_raw * np.array([180.0, 90.0], np.float32), cell_to_id, H3_RES)
         if use_effort:
             print(f" building cell→species lookup for effort weighting (effort_scale={effort_scale})...")
-            cell_species = build_cell_species(train_cells, class_ids, len(cells))
+            cell_presence = build_cell_presence_bits(train_cells, class_ids, len(cells), num_classes)
         if use_range_penalty:
             print(f" building range penalty table for {len(focal_class_ids)} focal classes "
                   f"(scale={range_penalty_scale})...")
@@ -832,9 +826,8 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         optimizer, logits_model, encoder, train_locs_tf, train_classes_tf, sample_background,
         bg_base_weight=bg_base_weight, grad_clip_value=grad_clip_value,
         head_optimizer=head_optimizer, head_weight_refs=head_weight_refs, effort_col=EFFORT_COL,
-        effort_scale=effort_scale if use_effort else 0.0, cell_species=cell_species,
+        effort_scale=effort_scale if use_effort else 0.0, cell_presence=cell_presence,
         focal_cols=focal_class_ids, cell_range_penalty=cell_range_penalty, jit_compile=jit_compile,
-        bg_batch_size=config["batch_size"],
     )
     run_steps = make_multi_step(train_step)
 

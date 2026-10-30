@@ -19,17 +19,18 @@ import tensorflow as tf
 
 from lib.models.encoders import CoordEncoder
 from lib.models.geo_model_net import make_geo_model_net_independent_head, IndependentPerClassHead
-from train_tf_sinr_test import make_train_step, make_multi_step
+from train_tf_sinr_test import make_train_step, make_multi_step, build_cell_presence_bits
 from utils import make_rand_samples_tf
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--jit", action="store_true")
 ap.add_argument("--steps", type=int, default=300)
 ap.add_argument("--steps_per_call", type=int, default=50)
+ap.add_argument("--num_classes", type=int, default=5_004)
 ap.add_argument("--species_per_cell", type=float, default=27, help="v42 real data: ~121 present classes per sampled bg row")
 args = ap.parse_args()
 
-K, F, B, N_CELLS, N_FEATS, N_POINTS = 5_004, 500, 512, 288_122, 56, 8_000_000
+K, F, B, N_CELLS, N_FEATS, N_POINTS = args.num_classes, 500, 512, 288_122, 56, 8_000_000
 rng = np.random.default_rng(0)
 focal = sorted(rng.choice(K, F, replace=False).tolist())
 model = make_geo_model_net_independent_head(K, focal, N_FEATS - 1, 512, 16)
@@ -38,7 +39,7 @@ head = next(l for l in model.layers if isinstance(l, IndependentPerClassHead))
 occupied = rng.choice(N_CELLS, 41_549, replace=False)
 lengths = np.zeros(N_CELLS, np.int64)
 lengths[occupied] = rng.poisson(args.species_per_cell, len(occupied))
-cell_species = tf.RaggedTensor.from_row_lengths(rng.integers(0, K, lengths.sum()).astype(np.int32), lengths)
+cell_presence = build_cell_presence_bits(np.repeat(np.arange(N_CELLS), lengths), rng.integers(0, K, lengths.sum()), N_CELLS, K)
 occupied_t = tf.constant(occupied.astype(np.int32))
 train_locs = tf.constant(np.stack([rng.uniform(-180, 180, N_POINTS), rng.uniform(-90, 90, N_POINTS)], 1).astype(np.float32))
 train_classes = tf.constant(rng.integers(0, K, N_POINTS))
@@ -52,9 +53,9 @@ step = make_train_step(
     tf.keras.optimizers.Adam(1e-4, clipnorm=1.0), logits_model, encoder, train_locs, train_classes,
     sample_background, bg_base_weight=1.5, grad_clip_value=1.0,
     head_optimizer=tf.keras.optimizers.Adam(1e-4), head_weight_refs={id(w) for w in head.trainable_weights},
-    effort_col=36, effort_scale=5.0, cell_species=cell_species, focal_cols=focal,
+    effort_col=36, effort_scale=5.0, cell_presence=cell_presence, focal_cols=focal,
     cell_range_penalty=tf.constant(rng.uniform(0, 15, (N_CELLS, F)).astype(np.float16)),
-    jit_compile=args.jit, bg_batch_size=B,
+    jit_compile=args.jit,
 )
 pw = tf.constant(np.full(K, 2.25, np.float32))
 idx_fixed = tf.random.uniform([B], 0, N_POINTS, dtype=tf.int64)
