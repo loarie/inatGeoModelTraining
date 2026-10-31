@@ -312,8 +312,9 @@ def make_subsampled_dataset_focal(
         ]
         if extra:
             idx = np.concatenate([idx] + extra)
+        n_focal = int(np.isin(class_ids_ss, focal_class_ids).sum()) + sum(len(e) for e in extra)
         print(f"  focal oversampled per-species (map, {len(focal_oversample_map)} classes): "
-              f"{len(idx):,} total obs")
+              f"{len(idx):,} total obs, focal share {n_focal / len(idx):.1%}")
     elif focal_class_ids and focal_oversample > 1:
         focal_idx = idx[np.isin(class_ids_ss, focal_class_ids)]
         idx = np.concatenate([idx, np.tile(focal_idx, focal_oversample - 1)])
@@ -384,6 +385,11 @@ def make_subsampled_dataset_focal(
 @click.option("--oversample_max", default=20, type=int,
               help="Cap on the per-species oversample factor from --oversample_target_exponent, so the "
                    "sparsest classes don't get an extreme multiplier. Default 20.")
+@click.option("--focal_oversample_scale", default=1, type=int,
+              help="Multiply every per-species factor from --oversample_target_exponent by this (after "
+                   "the --oversample_max cap). The per-species map only balances focal species against "
+                   "each other, so on a big dataset their total share of the epoch shrinks (13% of "
+                   "points at 25k species, 3% at 120k); this raises that share. Default 1 (off).")
 @click.option("--start_epoch", default=0, type=int,
               help="Resume training from this epoch (0-indexed). Load checkpoint saved after epoch N "
                    "by passing --start_epoch N. Checkpoint files must exist at {model_save_name}.epochNNN.keras.")
@@ -500,7 +506,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 range_penalty_scale, bg_base_weight, focal_head_dim, focal_head_random_init,
                 independent_head_dim,
                 pos_weight_balance_exponent, grad_clip_value, stability_check,
-                oversample_target_exponent, oversample_max,
+                oversample_target_exponent, oversample_max, focal_oversample_scale,
                 pos_weight_boost_taxa, pos_weight_boost_factor,
                 pos_weight_adapt, pos_weight_adapt_every, pos_weight_adapt_threshold,
                 pos_weight_adapt_factor, pos_weight_adapt_max, pos_weight_adapt_taxa,
@@ -618,7 +624,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         focal_counts = np.array([np.sum(class_ids == fc) for fc in focal_class_ids], dtype=np.float64)
         median_group_count = np.median(focal_counts)
         raw_factor = (median_group_count / np.maximum(focal_counts, 1.0)) ** oversample_target_exponent
-        factor = np.clip(np.round(raw_factor), 1, oversample_max).astype(int)
+        factor = np.clip(np.round(raw_factor), 1, oversample_max).astype(int) * focal_oversample_scale
         focal_oversample_map = {fc: int(f) for fc, f in zip(focal_class_ids, factor)}
         print(f" oversample_target_exponent={oversample_target_exponent}: "
               f"factor range [{factor.min()}, {factor.max()}] across {len(focal_class_ids)} focal classes")
