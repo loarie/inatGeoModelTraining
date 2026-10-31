@@ -6,7 +6,7 @@
 #   tmux new -s tests 'bash cloud/run_full_test.sh v46a 1 "--pos_weight 9.8"; \
 #                      HIDDEN_DIM=1024 bash cloud/run_full_test.sh v46b 1'
 # Arguments: NAME EPOCHS [EXTRA_TRAIN_ARGS]. Extra args come after the v45 ones, so they win.
-# HIDDEN_DIM overrides the config's hidden_dim. Outputs go to NAME/; each epoch is then scored
+# HIDDEN_DIM and INITIAL_LR override the config's hidden_dim and initial_lr. Outputs go to NAME/; each epoch is then scored
 # with check_population.py (on the GPU, after training) against train_full_v1's absence cells.
 set -uo pipefail
 source ~/geo-venv/bin/activate
@@ -18,6 +18,7 @@ trap 'kill $SMI_PID 2>/dev/null' EXIT
 
 sed -e "s|model_save_name: .*|model_save_name: \"$NAME/focal_full_model_$NAME.keras\"|" \
     -e "s|hidden_dim: .*|hidden_dim: ${HIDDEN_DIM:-512}|" \
+    -e "s|initial_lr: .*|initial_lr: ${INITIAL_LR:-0.0005}|" \
     focal_full_config_v45.yml > "$NAME/config_$NAME.yml"
 FOCAL=$(python -c "import numpy as np; print(','.join(str(t) for t in np.load('group500_taxa_v41.npy')))")
 # shellcheck disable=SC2086
