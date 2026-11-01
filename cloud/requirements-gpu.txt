@@ -16,3 +16,4 @@ click>=8
 PyYAML>=6
 tqdm
 wandb
+scikit-learn  # check_population.py stray score (BallTree)

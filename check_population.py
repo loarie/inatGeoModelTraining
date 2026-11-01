@@ -21,11 +21,28 @@ import h3
 import numpy as np
 import tensorflow as tf
 import yaml
+from sklearn.neighbors import BallTree
 
 from lib.models.encoders import CoordEncoder
 from lib.models.geo_model_net import FocalScatterAdd, IndependentPerClassHead
 
 H3_RES = 4
+EARTH_KM = 6371.0
+STRAY_GRID_STEP = 6  # raster pixels (1/12 deg) per stray-grid cell: a 0.5 deg land grid
+
+
+def land_grid(raster):
+    """(lon, lat) centres of the 0.5 deg land cells (raster is NaN over ocean) and their areas in km2."""
+    h, w = raster.shape[:2]
+    rows = np.arange(STRAY_GRID_STEP // 2, h, STRAY_GRID_STEP)
+    cols = np.arange(STRAY_GRID_STEP // 2, w, STRAY_GRID_STEP)
+    rr, cc = np.meshgrid(rows, cols, indexing="ij")
+    land = ~np.isnan(raster[rr, cc, 1])
+    lat = 90.0 - (rr[land] + 0.5) * 180.0 / h
+    lon = -180.0 + (cc[land] + 0.5) * 360.0 / w
+    cell_deg = STRAY_GRID_STEP * 180.0 / h
+    area = (np.radians(cell_deg) * EARTH_KM) ** 2 * np.cos(np.radians(lat))
+    return np.stack([lon, lat], axis=1).astype(np.float32), area
 
 
 def build_or_load_cell_stats(locs, cids, train_npy):
@@ -88,6 +105,11 @@ def main():
     ap.add_argument("--group", default="group500_taxa.npy",
                     help="focal 500-taxa group the model was trained with (v41+: group500_taxa_v41.npy)")
     ap.add_argument("--out_csv", default=None, help="optional per-taxon taxon_id,mean,specificity dump")
+    ap.add_argument("--stray_km", type=float, default=500,
+                    help="stray score: share of each species' predicted range (land, at the same "
+                         "presence-percentile threshold) farther than this from any of its observations. "
+                         "Catches far-off false positives (Arctic, other continents) that the specificity "
+                         "check can't see, since its absence cells need --min_obs observations. 0 disables.")
     ap.add_argument("--absence_npy", default=None,
                     help="take the true-absence cells from this dataset instead of --train_npy, so "
                          "models trained on different datasets are scored against the same cells")
@@ -134,7 +156,15 @@ def main():
         score_focal(encoded_cells[start:start + 4096, :-1]) for start in range(0, len(encoded_cells), 4096)
     ])
 
-    means, specs = {}, {}
+    if args.stray_km > 0:
+        grid_locs, grid_area = land_grid(raster)
+        enc_grid = encoder.encode(grid_locs)
+        grid_preds = np.concatenate([
+            score_focal(enc_grid[start:start + 4096, :-1]) for start in range(0, len(enc_grid), 4096)
+        ])
+        print(f"stray score: {len(grid_locs):,} land cells of 0.5 deg, > {args.stray_km:g} km from any observation")
+
+    means, specs, strays, stray_areas = {}, {}, {}, {}
     for i, cidx in enumerate(focal_class_ids):
         sp_locs = locs[cids == cidx]
         if len(sp_locs) == 0:
@@ -152,6 +182,18 @@ def main():
         if len(preds_here) > 0:
             specs[cidx] = 1 - (preds_here >= thresh).mean()
 
+        if args.stray_km > 0:
+            present = grid_preds[:, i] >= thresh
+            if present.any():
+                obs = np.unique(np.round(sp_locs, 1), axis=0)  # dedupe to 0.1 deg
+                tree = BallTree(np.radians(obs[:, ::-1]), metric="haversine")
+                dist_km = tree.query(np.radians(grid_locs[present][:, ::-1]), k=1)[0][:, 0] * EARTH_KM
+                far_area = grid_area[present][dist_km > args.stray_km].sum()
+                strays[cidx] = far_area / grid_area[present].sum()
+                stray_areas[cidx] = far_area
+            else:
+                strays[cidx], stray_areas[cidx] = 0.0, 0.0
+
     mean_vals = np.array(list(means.values()))
     spec_vals = np.array([specs[c] for c in means if c in specs])
     print(f"\n=== mean-prediction bucketing (n={len(mean_vals)}) ===")
@@ -166,11 +208,20 @@ def main():
     print(f"specificity < 0.5 (genuinely poor): {(spec_vals<0.5).sum()} ({100*(spec_vals<0.5).mean():.1f}%)")
     print(f"mean specificity: {spec_vals.mean():.4f}  median: {np.median(spec_vals):.4f}")
 
+    if strays:
+        sv = np.array([strays[c] for c in means])
+        sa = np.array([stray_areas[c] for c in means])
+        print(f"\n=== stray range (> {args.stray_km:g} km from any observation; share of predicted land area) ===")
+        print(f"stray share > 0.05: {(sv>0.05).sum()}  > 0.2: {(sv>0.2).sum()}  > 0.5: {(sv>0.5).sum()}")
+        print(f"mean stray share: {sv.mean():.4f}  median: {np.median(sv):.4f}  "
+              f"total stray area: {sa.sum()/1e6:.2f}M km2")
+
     if args.out_csv:
         with open(args.out_csv, "w") as f:
-            f.write("taxon_id,mean,specificity\n")
+            f.write("taxon_id,mean,specificity,stray_share,stray_km2\n")
             for c in means:
-                f.write(f"{int(unique_taxa[c])},{means[c]:.6f},{specs.get(c, float('nan')):.6f}\n")
+                f.write(f"{int(unique_taxa[c])},{means[c]:.6f},{specs.get(c, float('nan')):.6f},"
+                        f"{strays.get(c, float('nan')):.6f},{stray_areas.get(c, float('nan')):.0f}\n")
 
     print(f"\n=== cross-tab: low mean (<0.05) AND poor specificity (<0.5) = genuinely broken ===")
     genuinely_broken = [c for c in means if means[c] < 0.05 and c in specs and specs[c] < 0.5]
