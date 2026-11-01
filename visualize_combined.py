@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt, matplotlib.colors as mcolors
 import geopandas as gpd, warnings
 from lib.models.encoders import CoordEncoder
 from lib.models.geo_model_net import FocalScatterAdd, IndependentPerClassHead
+from check_population import make_focal_scorer
 
 import argparse, os, sys
 parser = argparse.ArgumentParser()
@@ -32,11 +33,9 @@ model = tf.keras.models.load_model(
 
 if args.train_npy:
     unique_taxa = np.load(f"{args.train_npy}_unique_taxa.npy")
-    _locs = np.load(f"{args.train_npy}_locs.npy")
     _cids = np.load(f"{args.train_npy}_class_ids.npy")
-    # build a lightweight dataframe-like structure for presence point lookups
-    _taxon_ids = unique_taxa[_cids]
-    df = pd.DataFrame({"longitude": _locs[:, 0], "latitude": _locs[:, 1], "taxon_id": _taxon_ids})
+    _locs = np.load(f"{args.train_npy}_locs.npy", mmap_mode="r")
+    df = None  # built below from just the plotted species' rows (the full set is 148M rows at 120k species)
 else:
     df = pd.read_csv(args.train_csv, usecols=["longitude","latitude","taxon_id"])
     unique_taxa = np.sort(df["taxon_id"].unique())
@@ -60,6 +59,11 @@ if len(focal) < len(all_focal):
     print(f"Note: {missing} not in dataset, skipping")
 
 class_indices = {tid: int(np.where(unique_taxa==tid)[0][0]) for _, tid in focal}
+if df is None:
+    _rows = np.flatnonzero(np.isin(_cids, list(class_indices.values())))
+    df = pd.DataFrame({"longitude": _locs[_rows, 0], "latitude": _locs[_rows, 1],
+                       "taxon_id": unique_taxa[_cids[_rows]]})
+    del _cids
 
 width, height = 2160, 1080
 lons = np.linspace(-180, 180, width, dtype=np.float32)
@@ -70,9 +74,9 @@ encoded = encoder.encode(locs)
 
 focal_indices = list(class_indices.values())
 all_preds = []
+score = make_focal_scorer(model, focal_indices)  # only the plotted classes' outputs
 for start in range(0, len(encoded), 4096):
-    batch = model(encoded[start:start+4096, :-1], training=False).numpy()
-    all_preds.append(batch[:, focal_indices])
+    all_preds.append(score(encoded[start:start+4096, :-1]))
 all_preds = np.concatenate(all_preds)  # shape: (pixels, 7)
 # remap cidx to position in focal_indices
 cidx_to_col = {cidx: col for col, cidx in enumerate(focal_indices)}
@@ -85,7 +89,7 @@ for name, tid in focal:
     enc = encoder.encode(presence)
     scores = []
     for start in range(0, len(enc), 4096):
-        scores.append(model(enc[start:start+4096, :-1], training=False).numpy()[:, cidx])
+        scores.append(score(enc[start:start+4096, :-1])[:, cidx_to_col[cidx]])
     scores = np.concatenate(scores)
     p = float(np.percentile(scores, PERCENTILE))
     thresholds[tid] = p
