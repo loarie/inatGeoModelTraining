@@ -18,7 +18,7 @@ parser.add_argument("--sensitivity", type=float, default=95.0,
                           "(100-sensitivity)th percentile of each species' own training scores.")
 parser.add_argument("--out", default=None, help="Output PNG path (default: combined_distribution.png)")
 parser.add_argument("--focal_taxa", default=None,
-                     help="Comma-separated taxon_ids to plot instead of the classic 7 named species.")
+                     help="Comma-separated taxon_ids (or Name=taxon_id) to plot instead of the classic 7 named species.")
 args, _ = parser.parse_known_args()
 
 with open(args.config) as f:
@@ -41,7 +41,9 @@ else:
     unique_taxa = np.sort(df["taxon_id"].unique())
 
 if args.focal_taxa:
-    all_focal = [(str(tid), int(tid)) for tid in args.focal_taxa.split(",")]
+    # "taxon_id" or "Name=taxon_id" entries
+    all_focal = [(t.rsplit("=", 1)[0] if "=" in t else t, int(t.rsplit("=", 1)[-1]))
+                 for t in args.focal_taxa.split(",")]
 else:
     all_focal = [
         ("Pika",       43188),
