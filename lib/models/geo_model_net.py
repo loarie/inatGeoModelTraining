@@ -2,6 +2,30 @@ import numpy as np
 import tensorflow as tf
 
 
+@tf.keras.utils.register_keras_serializable(package="geo_model_net")
+class ZeroInputColumns(tf.keras.layers.Layer):
+    """Sets the given input feature columns to 0, so the network can't use them (e.g. the
+    observation-effort raster channel, which the loss still reads from the encoded inputs).
+    Part of the saved model, so every prediction script gets the same inputs as training."""
+
+    def __init__(self, columns, **kwargs):
+        super().__init__(**kwargs)
+        self.columns = [int(c) for c in columns]
+
+    def build(self, input_shape):
+        mask = np.ones(int(input_shape[-1]), dtype=np.float32)
+        mask[self.columns] = 0.0
+        self.mask = tf.constant(mask)
+
+    def call(self, inputs):
+        return inputs * self.mask
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"columns": self.columns})
+        return config
+
+
 class FocalScatterAdd(tf.keras.layers.Layer):
     """Adds a (batch, n_focal) tensor into specific class columns of a (batch, num_classes)
     tensor, leaving all other columns unchanged. Used to inject a small dedicated focal-species
@@ -188,7 +212,8 @@ def make_geo_model_net_focal_head(
 
 
 def make_geo_model_net_independent_head(
-    num_classes, focal_class_indices, num_input_feats=5, hidden_dim=256, independent_head_dim=16
+    num_classes, focal_class_indices, num_input_feats=5, hidden_dim=256, independent_head_dim=16,
+    zero_input_columns=None,
 ):
     """Same shared backbone as make_geo_model_net (all classes get logits from it, unchanged),
     plus a small extra head for focal_class_indices only - but unlike
@@ -204,8 +229,9 @@ def make_geo_model_net_independent_head(
     construction: there's nothing for classes to compete over or start identically from.
     """
     inputs = tf.keras.layers.Input(shape=(num_input_feats,))
+    feats = ZeroInputColumns(zero_input_columns)(inputs) if zero_input_columns else inputs
 
-    x = tf.keras.layers.Dense(hidden_dim, activation="relu", kernel_initializer="he_normal")(inputs)
+    x = tf.keras.layers.Dense(hidden_dim, activation="relu", kernel_initializer="he_normal")(feats)
     x = ResLayer(hidden_dim)(x)
     x = ResLayer(hidden_dim)(x)
     x = ResLayer(hidden_dim)(x)
@@ -214,7 +240,7 @@ def make_geo_model_net_independent_head(
 
     focal_logits = IndependentPerClassHead(
         num_classes=len(focal_class_indices), input_dim=num_input_feats, hidden_dim=independent_head_dim,
-    )(inputs)
+    )(feats)
 
     combined_logits = FocalScatterAdd(num_classes, focal_class_indices)([shared_logits, focal_logits])
     combined_logits = tf.keras.layers.Dropout(rate=0.2)(combined_logits)
