@@ -17,3 +17,5 @@ PyYAML>=6
 tqdm
 wandb
 scikit-learn  # check_population.py stray score (BallTree)
+matplotlib  # plot_diversity_maps.py
+geopandas<1  # plot_diversity_maps.py country outlines (naturalearth_lowres was removed in 1.0)

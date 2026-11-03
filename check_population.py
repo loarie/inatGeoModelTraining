@@ -81,16 +81,26 @@ def make_focal_scorer(model, class_ids):
                   if isinstance(l, tf.keras.layers.Dense) and l.units == scatter.num_classes)
     head = next(l for l in model.layers if isinstance(l, (IndependentPerClassHead, tf.keras.layers.Dense))
                 and l is not shared and l.output is scatter.input[1])
-    features = tf.keras.Model(model.input, [shared.input, head.output])
     kernel = tf.gather(shared.kernel, class_ids, axis=1)
     bias = tf.gather(shared.bias, class_ids) if shared.use_bias else 0.0
     head_col = {c: i for i, c in enumerate(scatter.indices)}
-    head_idx = tf.constant([head_col.get(c, 0) for c in class_ids])
-    head_mask = tf.constant([float(c in head_col) for c in class_ids])
+    in_head = [j for j, c in enumerate(class_ids) if c in head_col]
+    cols = tf.constant([head_col[class_ids[j]] for j in in_head], tf.int32)
+    if isinstance(head, IndependentPerClassHead):
+        # score only the requested head columns: the full head is (rows, num_head_classes, dim)
+        features = tf.keras.Model(model.input, [shared.input, head.input])
+        head_logits = lambda f: head.score_classes(f, cols)
+    else:
+        features = tf.keras.Model(model.input, [shared.input, head.output])
+        head_logits = lambda f: tf.gather(f, cols, axis=1)
+    put = tf.constant(np.array(in_head, np.int32)[:, None])
 
     def score(x):
         h, f = features(x, training=False)
-        logits = tf.matmul(h, kernel) + bias + tf.gather(f, head_idx, axis=1) * head_mask
+        logits = tf.matmul(h, kernel) + bias
+        if in_head:
+            logits = tf.transpose(tf.tensor_scatter_nd_add(tf.transpose(logits), put,
+                                                           tf.transpose(head_logits(f))))
         return tf.sigmoid(logits).numpy()
     return score
 

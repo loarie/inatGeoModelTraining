@@ -34,14 +34,19 @@ class FocalScatterAdd(tf.keras.layers.Layer):
     def __init__(self, num_classes, indices, **kwargs):
         super().__init__(**kwargs)
         self.num_classes = num_classes
-        self.indices = list(indices)
-        scatter = np.zeros((len(self.indices), num_classes), dtype=np.float32)
-        for i, cls in enumerate(self.indices):
-            scatter[i, cls] = 1.0
-        self.scatter_matrix = tf.constant(scatter)
+        self.indices = [int(i) for i in indices]
+        # a head over every class in order needs no scatter (the matrix would be num_classes^2)
+        self.identity = self.indices == list(range(num_classes))
+        if not self.identity:
+            scatter = np.zeros((len(self.indices), num_classes), dtype=np.float32)
+            for i, cls in enumerate(self.indices):
+                scatter[i, cls] = 1.0
+            self.scatter_matrix = tf.constant(scatter)
 
     def call(self, inputs):
         base, focal_logits = inputs
+        if self.identity:
+            return base + focal_logits
         return base + tf.matmul(focal_logits, self.scatter_matrix)
 
     def get_config(self):
@@ -104,6 +109,18 @@ class IndependentPerClassHead(tf.keras.layers.Layer):
         h = tf.nn.relu(h)
         out = tf.einsum("bnh,nh->bn", h, self.W2) + self.b2[tf.newaxis, :]
         return out  # (batch, num_classes) - one independent scalar per class per example
+
+    def score_classes(self, inputs, head_idx):
+        """Head output for only the head columns head_idx: (batch, len(head_idx)). For scoring a
+        few classes of a big head without computing (and holding) all of them."""
+        w1 = tf.gather(self.W1, head_idx)
+        h = tf.nn.relu(tf.einsum("bi,nih->bnh", inputs, w1) + tf.gather(self.b1, head_idx)[tf.newaxis])
+        return tf.einsum("bnh,nh->bn", h, tf.gather(self.W2, head_idx)) + tf.gather(self.b2, head_idx)[tf.newaxis]
+
+    def score_rows(self, inputs, head_idx):
+        """Head output for one head column per row (row i scored for class head_idx[i]): (batch,)."""
+        h = tf.nn.relu(tf.einsum("bi,bih->bh", inputs, tf.gather(self.W1, head_idx)) + tf.gather(self.b1, head_idx))
+        return tf.reduce_sum(h * tf.gather(self.W2, head_idx), axis=1) + tf.gather(self.b2, head_idx)
 
     def get_config(self):
         config = super().get_config()

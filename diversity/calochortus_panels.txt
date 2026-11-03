@@ -1,0 +1,8 @@
+C._albus=51315,C._amabilis=59446,C._ambiguus=64405,C._amoenus=64406,C._apiculatus=64407,C._argillosus=64330,C._aureus=64408
+C._barbatus=56792,C._bruneaunis=64410,C._catalinae=64411,C._clavatus=58359,C._coeruleus=64419,C._concolor=64420,C._dunnii=64422
+C._elegans=64424,C._eurycarpus=51055,C._excavatus=64427,C._fimbriatus=64429,C._flexuosus=64430,C._greenei=64431,C._gunnisonii=83061
+C._howellii=159693,C._invenustus=64432,C._kennedyi=61494,C._leichtlinii=52542,C._longebarbatus=64438,C._luteus=51077,C._lyallii=62581
+C._macrocarpus=63311,C._minimus=60549,C._monophyllus=64441,C._nudus=60485,C._nuttallii=83078,C._obispoensis=64442,C._palmeri=75940
+C._persistens=75942,C._plummerae=75943,C._pulchellus=47326,C._purpureus=126865,C._raichei=64082,C._simulans=75944,C._splendens=58361
+C._striatus=75945,C._subalpinus=159696,C._superbus=51078,C._tiburonensis=57392,C._tolmiei=50840,C._umbellatus=51054,C._umpquaensis=159697
+C._uniflorus=61191,C._venustus=53902,C._vestae=64083,C._weedii=75947,C._westonii=75948

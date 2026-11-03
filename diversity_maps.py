@@ -32,7 +32,9 @@ ICONIC_LABELS = {
 
 
 def split_model(model):
-    """(features model -> [h, focal head output], kernel, bias, focal class ids in head order)."""
+    """(features model -> [h, head input], kernel, bias, focal class ids in head order, head).
+    The head is scored per class (IndependentPerClassHead.score_rows/score_classes), never in
+    full: a head over all 120k classes is (rows, 120k, dim)."""
     scatter = next((l for l in model.layers if isinstance(l, FocalScatterAdd)), None)
     out_dense = [l for l in model.layers if isinstance(l, tf.keras.layers.Dense)
                  and l.units == model.output.shape[-1]]
@@ -40,9 +42,8 @@ def split_model(model):
     bias = shared.bias if shared.use_bias else tf.zeros(shared.units)
     if scatter is None:
         return tf.keras.Model(model.input, shared.input), shared.kernel, bias, None, None
-    head = next(l for l in model.layers if isinstance(l, (IndependentPerClassHead, tf.keras.layers.Dense))
-                and l is not shared and l.output is scatter.input[1])
-    features = tf.keras.Model(model.input, [shared.input, head.output])
+    head = next(l for l in model.layers if isinstance(l, IndependentPerClassHead) and l.output is scatter.input[1])
+    features = tf.keras.Model(model.input, [shared.input, head.input])
     return features, shared.kernel, bias, np.array(scatter.indices), head
 
 
@@ -68,9 +69,12 @@ def main():
     encoder = CoordEncoder(config["inputs"]["loc_feat_encoding"], raster)
     model = tf.keras.models.load_model(
         args.model, custom_objects={"FocalScatterAdd": FocalScatterAdd, "IndependentPerClassHead": IndependentPerClassHead})
-    features, kernel, bias, focal_ids, _ = split_model(model)
+    features, kernel, bias, focal_ids, head = split_model(model)
     num_classes = kernel.shape[1]
     focal_pos = {int(c): i for i, c in enumerate(focal_ids)} if focal_ids is not None else {}
+    head_col = np.full(num_classes, -1, np.int64)  # class -> head column, -1 if not in the head
+    if focal_ids is not None:
+        head_col[focal_ids] = np.arange(len(focal_ids))
 
     # ---- per-class thresholds (logit space) from a sample of each class's own observations
     thr_path = os.path.join(args.out_dir, "thresholds_logit.npy")
@@ -104,10 +108,10 @@ def main():
             lg = tf.reduce_sum(h * tf.transpose(tf.gather(kernel, c, axis=1)), axis=1) + tf.gather(bias, c)
             lg = lg.numpy()
             if f is not None:
-                fp = np.array([focal_pos.get(int(k), -1) for k in c])
+                fp = head_col[c]
                 m = fp >= 0
                 if m.any():
-                    lg[m] += f.numpy()[np.flatnonzero(m), fp[m]]
+                    lg[m] += head.score_rows(tf.boolean_mask(f, m), fp[m]).numpy()
             scores[s:s + B] = lg
             if (s // B) % 50 == 0:
                 print(f"  {s:,}/{len(sel):,}", flush=True)
@@ -143,11 +147,15 @@ def main():
     fcol_j = np.array([j for j, _ in fcols], np.int64)
     fcol_h = np.array([h for _, h in fcols], np.int64)
 
+    if len(fcol_h):  # this head's columns only, gathered once
+        hw1, hb1 = tf.gather(head.W1, fcol_h), tf.gather(head.b1, fcol_h)[tf.newaxis]
+        hw2, hb2 = tf.gather(head.W2, fcol_h), tf.gather(head.b2, fcol_h)[tf.newaxis]
+
     w, hgt = int(round(360 / args.res_deg)), int(round(180 / args.res_deg))
     lons = -180 + (np.arange(w) + 0.5) * args.res_deg
     lats = 90 - (np.arange(hgt) + 0.5) * args.res_deg
     counts = np.zeros((len(labels), hgt * w), np.int32)
-    CH = 1024
+    CH = 1024 if len(fcol_h) <= 5000 else 64  # the head's hidden layer is (CH, len(fcol_h), dim)
     grid_lon, grid_lat = np.meshgrid(lons, lats)
     grid = np.stack([grid_lon.ravel(), grid_lat.ravel()], 1).astype(np.float32)
     seg_ids = np.repeat(np.arange(len(labels)), np.diff(seg))
@@ -159,7 +167,8 @@ def main():
         h, f = out if focal_ids is not None else (out, None)
         lg = tf.matmul(h, k_ord) + b_ord
         if f is not None and len(fcol_j):
-            add = tf.gather(f, fcol_h, axis=1)
+            hid = tf.nn.relu(tf.einsum("bi,nih->bnh", f, hw1) + hb1)
+            add = tf.einsum("bnh,nh->bn", hid, hw2) + hb2
             lg = tf.transpose(tf.tensor_scatter_nd_add(tf.transpose(lg), fcol_j[:, None], tf.transpose(add)))
         pres = tf.cast(lg >= 0, tf.float32)
         counts[:, s:s + CH] = tf.transpose(tf.matmul(pres, onehot)).numpy().astype(np.int32)

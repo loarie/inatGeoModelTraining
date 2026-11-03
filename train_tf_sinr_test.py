@@ -504,6 +504,11 @@ def make_subsampled_dataset_focal(
                    "background absences. Without this the model learns 'few observations -> absent', "
                    "so stacked ranges track iNat effort (v47: Congo ~1 species). Requires "
                    "--independent_head_dim.")
+@click.option("--head_all_classes", is_flag=True, default=False,
+              help="Give EVERY class its own independent head (--independent_head_dim), not just the "
+                   "--focal_taxa. Focal species still get the oversampling, range penalty and "
+                   "pos_weight_adapt; only the head is extended. Non-focal maps (e.g. Calochortus "
+                   "amabilis in v48) can't separate valley from foothills through the shared layer.")
 @click.option("--jit_compile", is_flag=True, default=False,
               help="XLA-compile the training step (tf.function(jit_compile=True)). Can be much faster "
                    "on GPU; off by default until verified on the target hardware.")
@@ -516,7 +521,8 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 pos_weight_boost_taxa, pos_weight_boost_factor,
                 pos_weight_adapt, pos_weight_adapt_every, pos_weight_adapt_threshold,
                 pos_weight_adapt_factor, pos_weight_adapt_max, pos_weight_adapt_taxa,
-                pos_weight_init_file, jit_compile, steps_per_call, full_shuffle, no_effort_input):
+                pos_weight_init_file, jit_compile, steps_per_call, full_shuffle, no_effort_input,
+                head_all_classes):
     if focal_head_dim > 0 and independent_head_dim > 0:
         raise click.UsageError("--focal_head_dim and --independent_head_dim are mutually exclusive")
     with open(config_file, "r") as f:
@@ -728,16 +734,17 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     elif independent_head_dim > 0:
         if not focal_class_ids:
             raise click.UsageError("--independent_head_dim requires --focal_taxa")
-        print(f" building independent per-class focal head (dim={independent_head_dim}) "
-              f"for {len(focal_class_ids)} classes {focal_class_ids}")
+        head_class_ids = list(range(num_classes)) if head_all_classes else focal_class_ids
+        print(f" building independent per-class head (dim={independent_head_dim}) for "
+              + (f"all {num_classes} classes" if head_all_classes else f"{len(focal_class_ids)} classes {focal_class_ids}"))
         fcnet = make_geo_model_net_independent_head(
-            num_classes=num_classes, focal_class_indices=focal_class_ids,
+            num_classes=num_classes, focal_class_indices=head_class_ids,
             num_input_feats=encoder.num_input_feats() - 1,
             hidden_dim=config.get("hidden_dim", 256), independent_head_dim=independent_head_dim,
             zero_input_columns=[EFFORT_COL] if no_effort_input else None,
         )
-    elif no_effort_input:
-        raise click.UsageError("--no_effort_input requires --independent_head_dim")
+    elif no_effort_input or head_all_classes:
+        raise click.UsageError("--no_effort_input and --head_all_classes require --independent_head_dim")
     else:
         fcnet = make_geo_model_net(
             num_classes=num_classes, num_input_feats=encoder.num_input_feats() - 1,
