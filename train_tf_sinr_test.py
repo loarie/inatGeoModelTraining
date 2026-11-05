@@ -53,7 +53,8 @@ def load_sinr_dataset_from_npy(prefix):
 def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample_background,
                     bg_base_weight=1.0, grad_clip_value=None, head_optimizer=None,
                     head_weight_refs=None, effort_col=None, effort_scale=0.0, cell_presence=None,
-                    focal_cols=None, cell_range_penalty=None, jit_compile=False):
+                    focal_cols=None, cell_range_penalty=None, pair_samplers=None,
+                    jit_compile=False):
     """Returns a compiled train_step(idx, pos_weight) -> loss, where idx is a batch of indices
     into the training points.
 
@@ -73,7 +74,8 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
                           observed in each H3 cell, as one packed bit per class.
       cell_range_penalty: (n_cells, n_focal) range penalty per H3 cell centroid, focal_cols order.
     effort_scale > 0 with cell_presence enables effort weighting; cell_range_penalty enables the
-    range penalty. All shapes are static, so the whole step can be XLA-compiled (jit_compile).
+    range penalty. pair_samplers, a list of (make_pair_sampler fn, weight), each add weight x the mean
+    absence loss of every row's own class at a paired observation location (nearby, look-alike). All shapes are static, so the whole step can be XLA-compiled (jit_compile).
 
     head_optimizer/head_weight_refs: if given, IndependentPerClassHead's own W1/b1/W2/b2 get
     updated through a SEPARATE optimizer with no clipping at all, instead of through `optimizer`
@@ -110,12 +112,19 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
         x_raw = tf.gather(train_locs, idx)
         ys = tf.gather(train_classes, idx)
         fake_norm, bg_cells = sample_background(tf.shape(idx)[0])
-        return core_step(x_raw, ys, fake_norm, pos_weight, bg_cells)
+        pair_raw = pair_w = pair_ys = None
+        if pair_samplers:
+            pairs = [(sample(idx, ys), w) for sample, w in pair_samplers]
+            pair_raw = tf.concat([p[0] for p, _ in pairs], axis=0)
+            pair_w = tf.concat([p[1] * w for p, w in pairs], axis=0)
+            pair_ys = tf.concat([ys] * len(pairs), axis=0)
+        return core_step(x_raw, ys, fake_norm, pos_weight, bg_cells, pair_raw, pair_w, pair_ys)
 
     @tf.function(reduce_retracing=True, jit_compile=jit_compile)
-    def core_step(x_raw, ys, fake_norm, pos_weight, bg_cells):
+    def core_step(x_raw, ys, fake_norm, pos_weight, bg_cells, pair_raw=None, pair_w=None, pair_ys=None):
         x = encoder.encode_tf(x_raw, normalize=True)
         fake_x = encoder.encode_tf(fake_norm, normalize=False)
+        pair_x = encoder.encode_tf(pair_raw, normalize=True) if pair_raw is not None else None
         with tf.GradientTape() as tape:
             logits = model(x[:, :-1], training=True)
             fake_logits = model(fake_x[:, :-1], training=True)
@@ -134,6 +143,10 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
                 bg_effort=bg_effort, bg_present=bg_present,
                 focal_cols=focal_cols_t, bg_range_penalty=bg_range_penalty,
             )
+            if pair_x is not None:
+                own = tf.stack([tf.range(tf.shape(pair_ys)[0], dtype=pair_ys.dtype), pair_ys], axis=1)
+                pair_logits = tf.gather_nd(model(pair_x[:, :-1], training=True), own)
+                loss += tf.reduce_sum(pair_w * tf.nn.softplus(pair_logits)) / tf.cast(tf.shape(ys)[0], tf.float32)
 
         gradients = tape.gradient(loss, weights)
         head_pairs = [(g, w) for g, w in zip(gradients, weights) if id(w) in head_weight_refs]
@@ -222,6 +235,80 @@ def build_cell_range_penalty(cells, focal_class_ids, locs, class_ids, scale, nor
         )
         table[:, i] = np.minimum(dist_deg / norm_deg, cap) * scale
     return table
+
+
+def ring_neighbours(cells, cell_to_id, occupied, rings):
+    """(len(occupied), 1 + 3 rings (rings + 1)) global cell ids: every H3 cell within `rings` of
+    each occupied cell (pentagons, with fewer, repeat their first)."""
+    width = 1 + 3 * rings * (rings + 1)
+    out = np.zeros((len(occupied), width), np.int64)
+    for k, g in enumerate(tqdm.tqdm(occupied, desc="  ring neighbours")):
+        ring = [cell_to_id[c] for c in h3.k_ring(cells[g], rings) if c in cell_to_id]
+        out[k] = ring + ring[:1] * (width - len(ring))
+    return out
+
+
+def lookalike_neighbours(cells, occupied, env, max_km, min_km, k):
+    """(len(occupied), k) global cell ids: for each occupied cell, the k occupied cells between
+    min_km and max_km away whose environment (env, one row per occupied cell) is closest. A cell
+    with fewer candidates repeats them; one with none uses itself."""
+    from sklearn.neighbors import BallTree
+    env = (env - env.mean(0)) / (env.std(0) + 1e-6)
+    cent = np.radians(np.array([h3.h3_to_geo(cells[g]) for g in occupied]))  # (lat, lon)
+    tree = BallTree(cent, metric="haversine")
+    out = np.empty((len(occupied), k), np.int64)
+    for i in tqdm.tqdm(range(len(occupied)), desc="  look-alike neighbours"):
+        cand, dist = tree.query_radius(cent[i:i + 1], max_km / 6371.0, return_distance=True)
+        cand = cand[0][dist[0] * 6371.0 > min_km]
+        if len(cand) == 0:
+            out[i] = occupied[i]
+            continue
+        best = cand[np.argsort(((env[cand] - env[i]) ** 2).sum(1))[:k]]
+        out[i] = occupied[np.resize(best, k)]
+    return out
+
+
+def make_pair_sampler(occupied, nbr_global, train_cells, train_locs, cell_presence):
+    """TF fn (idx, ys) -> (raw (lon, lat) of a paired training point for each row, weight 0/1).
+    The paired point is a random training point (a real observation location, so somewhere
+    surveyed) in a random one of the row's cell's neighbour cells (nbr_global, one row per
+    occupied cell); the weight is 0 when no training point is in that cell or when the row's own
+    class ys was observed there (cell_presence)."""
+    occupied = np.asarray(occupied)
+    inv = np.searchsorted(occupied, train_cells)
+    order = np.argsort(inv, kind="stable")
+    counts = np.bincount(inv, minlength=len(occupied))
+    starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+    # row 0 = an empty cell (count 0); occupied cell k is row k + 1
+    n_cells = int(max(occupied.max(), nbr_global.max())) + 1
+    occ_row = np.zeros(n_cells, np.int64)
+    occ_row[occupied] = np.arange(1, len(occupied) + 1)
+    width = nbr_global.shape[1]
+    nbr_global = np.concatenate([np.zeros((1, width), np.int64), nbr_global])
+    print(f"  {len(occupied):,} occupied cells, {width} paired cells each")
+    occ_row_t, nbr_t, nbr_global_t = tf.constant(occ_row), tf.constant(occ_row[nbr_global]), tf.constant(nbr_global)
+    counts_t = tf.constant(np.concatenate([[0], counts]).astype(np.int64))
+    starts_t = tf.constant(np.concatenate([[0], starts]).astype(np.int64))
+    order_t = tf.constant(order.astype(np.int64))
+    cells_t = tf.constant(train_cells.astype(np.int64))
+    cell_row, cell_bits = cell_presence
+
+    def sample(idx, ys):
+        n = tf.shape(idx)[0]
+        row = tf.gather(occ_row_t, tf.gather(cells_t, idx))
+        pick = tf.random.uniform([n], 0, width, dtype=tf.int32)
+        pair = tf.stack([row, tf.cast(pick, tf.int64)], axis=1)
+        nb, nb_cell = tf.gather_nd(nbr_t, pair), tf.gather_nd(nbr_global_t, pair)
+        cnt = tf.gather(counts_t, nb)
+        r = tf.cast(tf.random.uniform([n]) * tf.cast(cnt, tf.float32), tf.int64)
+        r = tf.minimum(r, tf.maximum(cnt - 1, 0))
+        pair_raw = tf.gather(train_locs, tf.gather(order_t, tf.gather(starts_t, nb) + r))
+        byte = tf.gather_nd(cell_bits, tf.stack([tf.gather(cell_row, nb_cell), ys // 8], axis=1))
+        present = tf.bitwise.bitwise_and(tf.bitwise.right_shift(byte, tf.cast(ys % 8, tf.uint8)), 1)
+        weight = tf.cast(cnt > 0, tf.float32) * (1.0 - tf.cast(present, tf.float32))
+        return pair_raw, weight
+
+    return sample
 
 
 PREDICT_CHUNK = 4096  # rows per forward pass in adapt_pos_weight (4096 x 120k classes = 2GB)
@@ -509,6 +596,24 @@ def make_subsampled_dataset_focal(
                    "--focal_taxa. Focal species still get the oversampling, range penalty and "
                    "pos_weight_adapt; only the head is extended. Non-focal maps (e.g. Calochortus "
                    "amabilis in v48) can't separate valley from foothills through the shared layer.")
+@click.option("--near_bg_weight", default=0.0, type=float,
+              help="Nearby negatives: pair every training point with another training point drawn "
+                   "from a random H3-4 cell within --near_bg_rings of it, and push the point's OWN "
+                   "species down there (weight this x the mean), unless that species was observed in "
+                   "that cell. The shared background is spread like all the observations, so in a "
+                   "global model a regional species sees few local absences (California + world "
+                   "species: Calochortus local AUC .948 -> .910). 0 disables.")
+@click.option("--near_bg_rings", default=3, type=int,
+              help="H3-4 rings for --near_bg_weight (~39km per ring; 3 = ~120km).")
+@click.option("--lookalike_bg_weight", default=0.0, type=float,
+              help="Look-alike negatives: like --near_bg_weight, but the paired cell is one of the "
+                   "--lookalike_k occupied H3-4 cells with the most similar environment (elevation + "
+                   "bioclim) between --lookalike_min_km and --lookalike_max_km away - the similar "
+                   "habitat a little further off that nearby negatives miss (C. amabilis: Sierra "
+                   "foothills). 0 disables.")
+@click.option("--lookalike_max_km", default=500.0, type=float)
+@click.option("--lookalike_min_km", default=100.0, type=float)
+@click.option("--lookalike_k", default=20, type=int)
 @click.option("--jit_compile", is_flag=True, default=False,
               help="XLA-compile the training step (tf.function(jit_compile=True)). Can be much faster "
                    "on GPU; off by default until verified on the target hardware.")
@@ -522,7 +627,8 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 pos_weight_adapt, pos_weight_adapt_every, pos_weight_adapt_threshold,
                 pos_weight_adapt_factor, pos_weight_adapt_max, pos_weight_adapt_taxa,
                 pos_weight_init_file, jit_compile, steps_per_call, full_shuffle, no_effort_input,
-                head_all_classes):
+                head_all_classes, near_bg_weight, near_bg_rings, lookalike_bg_weight, lookalike_max_km,
+                lookalike_min_km, lookalike_k):
     if focal_head_dim > 0 and independent_head_dim > 0:
         raise click.UsageError("--focal_head_dim and --independent_head_dim are mutually exclusive")
     with open(config_file, "r") as f:
@@ -653,7 +759,9 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
     effort_scale = config.get("effort_scale", 0.0)
     use_effort = effort_scale > 0 and bg_sampling == "target_group"
     use_range_penalty = range_penalty_scale > 0 and bool(focal_class_ids)
+    use_near = near_bg_weight > 0 or lookalike_bg_weight > 0
     cell_to_id = cell_presence = cell_range_penalty = None
+    pair_samplers = []
     bg_pool_cells = rand_pool_cells = None
 
     # a fixed pool of uniform random background points: for target-group sampling's random
@@ -666,7 +774,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         print(f" pre-computing random background pool ({n_rand_pool:,} points)...")
         rand_pool_raw = np.array(make_rand_samples_tf(n_rand_pool), dtype=np.float32)
 
-    if use_effort or use_range_penalty:
+    if use_effort or use_range_penalty or use_near:
         cells = [c for r0 in sorted(h3.get_res0_indexes()) for c in sorted(h3.h3_to_children(r0, H3_RES))]
         cell_to_id = {c: i for i, c in enumerate(cells)}
         print(f" pre-computing H3-{H3_RES} cell ids ({len(cells):,} cells) for training points...")
@@ -678,9 +786,26 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
             # point was looked up as if it sat within ~1 degree of 0N 0E, so its effort "present"
             # set and range penalty came from the Gulf of Guinea instead of its real location.)
             rand_pool_cells = h3_cell_ids(rand_pool_raw * np.array([180.0, 90.0], np.float32), cell_to_id, H3_RES)
-        if use_effort:
+        if use_effort or use_near:
             print(f" building cell→species lookup for effort weighting (effort_scale={effort_scale})...")
             cell_presence = build_cell_presence_bits(train_cells, class_ids, len(cells), num_classes)
+        occupied = np.unique(train_cells)
+        if near_bg_weight > 0:
+            print(f" building nearby-negative tables ({near_bg_rings} H3-{H3_RES} rings, "
+                  f"weight {near_bg_weight})...")
+            nbr = ring_neighbours(cells, cell_to_id, occupied, near_bg_rings)
+            pair_samplers.append((make_pair_sampler(occupied, nbr, train_cells, train_locs_tf, cell_presence),
+                                  near_bg_weight))
+        if lookalike_bg_weight > 0:
+            print(f" building look-alike-negative tables ({lookalike_k} cells, {lookalike_min_km:g}-"
+                  f"{lookalike_max_km:g}km, weight {lookalike_bg_weight})...")
+            centroids = np.array([h3.h3_to_geo(cells[g])[::-1] for g in occupied], np.float32)
+            n_raster = encoder.raster.shape[-1]
+            # elevation + the 19 bioclim channels (format_env_feats.py order)
+            env = encoder.encode(centroids)[:, -n_raster:][:, :20]
+            nbr = lookalike_neighbours(cells, occupied, env, lookalike_max_km, lookalike_min_km, lookalike_k)
+            pair_samplers.append((make_pair_sampler(occupied, nbr, train_cells, train_locs_tf, cell_presence),
+                                  lookalike_bg_weight))
         if use_range_penalty:
             print(f" building range penalty table for {len(focal_class_ids)} focal classes "
                   f"(scale={range_penalty_scale})...")
@@ -869,7 +994,8 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
         bg_base_weight=bg_base_weight, grad_clip_value=grad_clip_value,
         head_optimizer=head_optimizer, head_weight_refs=head_weight_refs, effort_col=EFFORT_COL,
         effort_scale=effort_scale if use_effort else 0.0, cell_presence=cell_presence,
-        focal_cols=focal_class_ids, cell_range_penalty=cell_range_penalty, jit_compile=jit_compile,
+        focal_cols=focal_class_ids, cell_range_penalty=cell_range_penalty,
+        pair_samplers=pair_samplers, jit_compile=jit_compile,
     )
     run_steps = make_multi_step(train_step)
 
