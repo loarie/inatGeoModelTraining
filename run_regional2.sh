@@ -29,4 +29,13 @@ for ckpt in ca/"$NAME"/model_"$NAME".epoch*.keras; do
         --taxa "${DATA}_calochortus.npy" --out_csv "ca/$NAME/eval_${NAME}_e$e.csv" 2>&1 \
         | grep -E "scored|well-sampled|Error" | sed "s/^/e$e /" >> "ca/$NAME/eval_$NAME.log"
 done
+# far-off strays of 500 world species (the global failure the Calochortus scores can't see)
+if [ -f caworld_world500.npy ] && [ "$DATA" = train_caworld_v1 ]; then
+    for ckpt in ca/"$NAME"/model_"$NAME".epoch*.keras; do
+        e=$(basename "$ckpt" .keras | sed 's/.*\.epoch//')
+        python check_population.py --model "$ckpt" --config "ca/$NAME/config_$NAME.yml" --train_npy "$DATA" \
+            --absence_npy train_full_v1 --group caworld_world500.npy --out_csv "ca/$NAME/world500_${NAME}_e$e.csv" 2>&1 \
+            | grep -E "^specificity >= 0.95|mean stray|stray share >" | sed "s/^/e$e /" >> "ca/$NAME/eval_$NAME.log"
+    done
+fi
 echo "ALL_DONE" >> "ca/$NAME/train_$NAME.log"

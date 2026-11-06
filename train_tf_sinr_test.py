@@ -50,6 +50,36 @@ def load_sinr_dataset_from_npy(prefix):
     return locs, class_ids, unique_taxa
 
 
+def make_own_logit(model):
+    """fn(x, ys, training) -> (batch,) pre-sigmoid logit of each row's own class ys only, for
+    the paired negatives: a full forward pass computes all num_classes logits (a 512 x 120k
+    matmul, plus its gradient) to use one, which made v49's steps ~4x slower than v48's. Reads
+    the shared Dense column and, for focal classes, the IndependentPerClassHead column directly.
+    Skips the final logit dropout. None if the model is not that shape (then use the full pass)."""
+    scat = [l for l in model.layers if isinstance(l, FocalScatterAdd)]
+    head = [l for l in model.layers if isinstance(l, IndependentPerClassHead)]
+    if len(scat) != 1 or len(head) != 1:
+        return None
+    scat, head = scat[0], head[0]
+    dense = [l for l in model.layers if isinstance(l, tf.keras.layers.Dense) and l.units == scat.num_classes]
+    if len(dense) != 1:
+        return None
+    dense = dense[0]
+    feats = tf.keras.Model(model.input, [dense.input, head.input])
+    head_pos = np.full(scat.num_classes, -1, np.int64)
+    head_pos[scat.indices] = np.arange(len(scat.indices))
+    head_pos = tf.constant(head_pos)
+
+    def own_logit(x, ys, training):
+        h, f = feats(x, training=training)
+        logit = tf.reduce_sum(h * tf.transpose(tf.gather(dense.kernel, ys, axis=1)), axis=1)
+        hp = tf.gather(head_pos, ys)
+        focal = head.score_rows(f, tf.maximum(hp, 0))
+        return logit + tf.where(hp >= 0, focal, tf.zeros_like(focal))
+
+    return own_logit
+
+
 def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample_background,
                     bg_base_weight=1.0, grad_clip_value=None, head_optimizer=None,
                     head_weight_refs=None, effort_col=None, effort_scale=0.0, cell_presence=None,
@@ -90,6 +120,7 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
     (see the comment below, added after v30), and IndependentPerClassHead has no shared
     parameters between classes by construction - there's nothing for one class to crowd out."""
     weights = model.trainable_weights
+    own_logit = make_own_logit(model) if pair_samplers else None
     head_weight_refs = head_weight_refs or set()
     head_vars = [w for w in weights if id(w) in head_weight_refs]
     other_vars = [w for w in weights if id(w) not in head_weight_refs]
@@ -144,8 +175,11 @@ def make_train_step(optimizer, model, encoder, train_locs, train_classes, sample
                 focal_cols=focal_cols_t, bg_range_penalty=bg_range_penalty,
             )
             if pair_x is not None:
-                own = tf.stack([tf.range(tf.shape(pair_ys)[0], dtype=pair_ys.dtype), pair_ys], axis=1)
-                pair_logits = tf.gather_nd(model(pair_x[:, :-1], training=True), own)
+                if own_logit is not None:
+                    pair_logits = own_logit(pair_x[:, :-1], pair_ys, True)
+                else:
+                    own = tf.stack([tf.range(tf.shape(pair_ys)[0], dtype=pair_ys.dtype), pair_ys], axis=1)
+                    pair_logits = tf.gather_nd(model(pair_x[:, :-1], training=True), own)
                 loss += tf.reduce_sum(pair_w * tf.nn.softplus(pair_logits)) / tf.cast(tf.shape(ys)[0], tf.float32)
 
         gradients = tape.gradient(loss, weights)
@@ -309,6 +343,15 @@ def make_pair_sampler(occupied, nbr_global, train_cells, train_locs, cell_presen
         return pair_raw, weight
 
     return sample
+
+
+def random_pair_sampler(idx, ys):
+    """A make_pair_sampler stand-in: a uniformly random (lon, lat) on the sphere for every row,
+    weight 1 (for --own_random_bg_weight)."""
+    n = tf.shape(idx)[0]
+    lon = tf.random.uniform([n], -180.0, 180.0)
+    lat = tf.math.asin(tf.random.uniform([n], -1.0, 1.0)) * (180.0 / np.pi)
+    return tf.stack([lon, lat], axis=1), tf.ones([n])
 
 
 PREDICT_CHUNK = 4096  # rows per forward pass in adapt_pos_weight (4096 x 120k classes = 2GB)
@@ -614,6 +657,11 @@ def make_subsampled_dataset_focal(
 @click.option("--lookalike_max_km", default=500.0, type=float)
 @click.option("--lookalike_min_km", default=100.0, type=float)
 @click.option("--lookalike_k", default=20, type=int)
+@click.option("--own_random_bg_weight", default=0.0, type=float,
+              help="Each record also gets an absence for its own class at a uniformly random point "
+                   "on the globe (land or sea), at this weight. Balances --near_bg_weight and "
+                   "--lookalike_bg_weight, which only push a species down where people survey, so its "
+                   "score rose in empty places instead (v49: Cakile maritima in mid-ocean). 0 disables.")
 @click.option("--jit_compile", is_flag=True, default=False,
               help="XLA-compile the training step (tf.function(jit_compile=True)). Can be much faster "
                    "on GPU; off by default until verified on the target hardware.")
@@ -628,7 +676,7 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
                 pos_weight_adapt_factor, pos_weight_adapt_max, pos_weight_adapt_taxa,
                 pos_weight_init_file, jit_compile, steps_per_call, full_shuffle, no_effort_input,
                 head_all_classes, near_bg_weight, near_bg_rings, lookalike_bg_weight, lookalike_max_km,
-                lookalike_min_km, lookalike_k):
+                lookalike_min_km, lookalike_k, own_random_bg_weight):
     if focal_head_dim > 0 and independent_head_dim > 0:
         raise click.UsageError("--focal_head_dim and --independent_head_dim are mutually exclusive")
     with open(config_file, "r") as f:
@@ -989,6 +1037,8 @@ def train_model(config_file, train_csv, train_npy, bg_csv, bg_sampling, bg_tg_fr
 
     pos_weight = tf.constant(pos_weight_np, dtype=tf.float32)
 
+    if own_random_bg_weight > 0:
+        pair_samplers.append((random_pair_sampler, own_random_bg_weight))
     train_step = make_train_step(
         optimizer, logits_model, encoder, train_locs_tf, train_classes_tf, sample_background,
         bg_base_weight=bg_base_weight, grad_clip_value=grad_clip_value,
